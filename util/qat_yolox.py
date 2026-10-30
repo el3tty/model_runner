@@ -31,7 +31,7 @@ class QBaseConv(nn.Module):
         assert not hasattr(base, "bn"), "fold BatchNorm first (fuse_model)"
         self.conv = QConv2d(base.conv, cfg)
         self.act = base.act
-        self.out_q = ActFakeQuant(cfg.act_signed)
+        self.out_q = ActFakeQuant()
         self.k230 = False  # K230 arithmetic emulation, see set_k230()
 
     def forward(self, x):
@@ -46,7 +46,7 @@ class QBottleneck(nn.Module):
         self.conv1 = b.conv1
         self.conv2 = b.conv2
         self.use_add = b.use_add
-        self.add_q = ActFakeQuant(cfg.act_signed) if b.use_add else None
+        self.add_q = ActFakeQuant() if b.use_add else None
         self.k230 = False  # K230 arithmetic emulation, see set_k230()
 
     def forward(self, x):
@@ -158,7 +158,7 @@ def load_qat_checkpoint(path, name="yolox-nano", exp_file=None):
     disabled, use qat_generic.set_state() to switch them on."""
     exp = get_exp(exp_file, name)
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    cfg = QuantConfig(**ckpt["cfg"])
+    cfg = QuantConfig.from_dict(ckpt["cfg"])
     qat = build_qat_model(exp, cfg)
     qat.load_state_dict(ckpt["model"])
     qat.eval()

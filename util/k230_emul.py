@@ -20,7 +20,7 @@ functions can be used for K230-aware fine-tuning. The model specific wiring is q
 import torch
 import torch.nn.functional as F
 
-from util.qat_generic import act_qparams, int_range
+from util.qat_generic import QMAX, QMIN, act_qparams
 
 # SwishToFakeActivation.cs: segment i covers [xs[i-1], xs[i]), y = ks[i] * x + bs[i]
 SILU_XS = [-6.8, -4.0, -2.2, -1.6, -1.2, -0.8, -0.4, 0.0, 0.4, 0.8, 1.2, 1.6, 2.2, 4.0, 6.8]
@@ -86,10 +86,9 @@ def conv_f16(qconv, x):
 
 def _quant_code(code, q):
     """Round / clamp an output code computed in f16 and dequantize it with the parameters of ActFakeQuant q."""
-    scale, zp = act_qparams(q.params.min_val, q.params.max_val, q.signed)
-    qmin, qmax = int_range(q.signed)
+    scale, zp = act_qparams(q.params.min_val, q.params.max_val)
     code = code + (torch.round(code) - code).detach()
-    return (code.clamp(qmin, qmax) - zp) * scale
+    return (code.clamp(QMIN, QMAX) - zp) * scale
 
 
 def silu_quant(z, q):
@@ -98,7 +97,7 @@ def silu_quant(z, q):
         q.params.update(silu(z))
     if not q.enabled:
         return f16(silu(z))
-    scale, zp = act_qparams(q.params.min_val, q.params.max_val, q.signed)
+    scale, zp = act_qparams(q.params.min_val, q.params.max_val)
     k, b = _segments(z, SILU_XS, SILU_KS, SILU_BS)
     code = f16(f16(f16(k / scale) * z) + f16(b / scale + zp))
     return _quant_code(code, q)
@@ -111,7 +110,7 @@ def add_quant(a, b, q):
         q.params.update(s)
     if not q.enabled:
         return s
-    scale, zp = act_qparams(q.params.min_val, q.params.max_val, q.signed)
+    scale, zp = act_qparams(q.params.min_val, q.params.max_val)
     code = f16(f16(s * f16(1.0 / scale)) + zp)
     return _quant_code(code, q)
 

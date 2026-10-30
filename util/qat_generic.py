@@ -3,7 +3,7 @@
 
 Nothing here knows about a particular network: it works on any torch model made of nn.Conv2d layers.
   * QuantConfig, act_qparams, weight_qparams: the range / scale / zero-point rules copied from nncase
-    (QuantUtility.GetQuantParam, FixupRange, GetWeightsRangesByChannel); uint8 or int8 symmetric.
+    (QuantUtility.GetQuantParam, FixupRange, GetWeightsRangesByChannel); uint8 (nncase UnsignedMode) only.
   * RangeObserver, ActFakeQuant, WeightFakeQuant, QConv2d: the fake-quant modules (activation ranges can be shared
     between several quantizers, see tie_ranges).
   * set_state, set_observer_momentum, describe, dump_ranges, calibrate, check_fold, bake_weights, export_onnx.
@@ -25,54 +25,43 @@ import torch.nn.functional as F
 # ----------------------------------------------------------------------------------------------------------------------
 @dataclass
 class QuantConfig:
-    act_signed: bool = False  # False: uint8 (nncase UnsignedMode), True: int8 symmetric (SignedSymmetricMode)
-    w_signed: bool = False
     quantize_head_outputs: bool = False  # also fake-quantize the outputs of cls/reg/obj prediction convs
     tie_concats: bool = True  # concat inputs share one range (nncase UniteConcatRange; verify on your model)
 
+    @classmethod
+    def from_dict(cls, d):
+        """QuantConfig of a checkpoint's "cfg". Older checkpoints also have act_signed / w_signed (the removed int8
+        mode): accepted when False, refused when True."""
+        d = dict(d)
+        signed = [k for k in ("act_signed", "w_signed") if d.pop(k, False)]
+        if signed:
+            raise ValueError(f"checkpoint uses int8 quantization ({', '.join(signed)}), which is no longer supported")
+        return cls(**d)
 
-def int_range(signed):
-    return (-127, 127) if signed else (0, 255)
+
+QMIN, QMAX = 0, 255  # uint8 for activations and weights (the nncase default)
 
 
-def onnx_range(signed):
-    return (-128, 127) if signed else (0, 255)
-
-
-def act_qparams(min_val, max_val, signed):
+def act_qparams(min_val, max_val):
     """nncase: Quantizer.FixUpRange + QuantUtility.GetQuantParam. Returns (scale[1] float32, zero_point[1] int32)."""
-    qmin, qmax = int_range(signed)
-    if signed:
-        r = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=0.01)
-        scale = r / qmax
-        zp = torch.zeros_like(scale)
-    else:
-        lo = min_val.clamp(max=0.0)  # the range always contains zero
-        hi = max_val.clamp(min=0.0)
-        r = hi - lo
-        r = torch.where(r < 1e-6, torch.full_like(r, 0.1), r.clamp(min=0.01))
-        scale = r / (qmax - qmin)
-        zp = torch.round(-lo / scale).clamp(qmin, qmax)
+    lo = min_val.clamp(max=0.0)  # the range always contains zero
+    hi = max_val.clamp(min=0.0)
+    r = hi - lo
+    r = torch.where(r < 1e-6, torch.full_like(r, 0.1), r.clamp(min=0.01))
+    scale = r / (QMAX - QMIN)
+    zp = torch.round(-lo / scale).clamp(QMIN, QMAX)
     return scale.reshape(1).float(), zp.reshape(1).to(torch.int32)
 
 
-def weight_qparams(w, signed):
+def weight_qparams(w):
     """nncase: QuantUtility.GetWeightsRangesByChannel + GetQuantParam, per output channel (dim 0)."""
-    qmin, qmax = int_range(signed)
     flat = w.detach().reshape(w.shape[0], -1)
-    lo = flat.amin(dim=1)
-    hi = flat.amax(dim=1)
-    if signed:
-        r = torch.maximum(lo.abs(), hi.abs()).clamp(min=0.01)
-        scale = r / qmax
-        zp = torch.zeros_like(scale)
-    else:
-        lo = lo.clamp(max=0.0)
-        hi = hi.clamp(min=0.0)
-        r = hi - lo
-        r = torch.where(r == 0, torch.full_like(r, 0.1), r.clamp(min=0.01))
-        scale = r / (qmax - qmin)
-        zp = torch.round(-lo / scale).clamp(qmin, qmax)
+    lo = flat.amin(dim=1).clamp(max=0.0)
+    hi = flat.amax(dim=1).clamp(min=0.0)
+    r = hi - lo
+    r = torch.where(r == 0, torch.full_like(r, 0.1), r.clamp(min=0.01))
+    scale = r / (QMAX - QMIN)
+    zp = torch.round(-lo / scale).clamp(QMIN, QMAX)
     return scale.float(), zp.to(torch.int32)
 
 
@@ -107,9 +96,8 @@ class RangeObserver(nn.Module):
 class ActFakeQuant(nn.Module):
     """Per-tensor activation fake-quant. `params` can be shared with other ActFakeQuant (see tie())."""
 
-    def __init__(self, signed):
+    def __init__(self):
         super().__init__()
-        self.signed = signed
         self.params = RangeObserver()
         self.enabled = False
         self.observe = False
@@ -119,33 +107,28 @@ class ActFakeQuant(nn.Module):
             self.params.update(x)
         if not self.enabled:
             return x
-        scale, zp = act_qparams(self.params.min_val, self.params.max_val, self.signed)
-        qmin, qmax = int_range(self.signed)
+        scale, zp = act_qparams(self.params.min_val, self.params.max_val)
         if torch.onnx.is_in_onnx_export():
-            # constants (not traced ops) and the int8 range the ONNX exporter accepts; with a symmetric scale the values
-            # never reach -128, so the result is the same
-            return torch.fake_quantize_per_tensor_affine(x, float(scale), int(zp), *onnx_range(self.signed))
-        return torch.fake_quantize_per_tensor_affine(x, scale, zp, qmin, qmax)
+            # constants, not traced ops
+            return torch.fake_quantize_per_tensor_affine(x, float(scale), int(zp), QMIN, QMAX)
+        return torch.fake_quantize_per_tensor_affine(x, scale, zp, QMIN, QMAX)
 
 
 class WeightFakeQuant(nn.Module):
     """Per-output-channel weight fake-quant; the ranges are recomputed from the weights on every call."""
 
-    def __init__(self, signed):
+    def __init__(self):
         super().__init__()
-        self.signed = signed
         self.enabled = False
 
     def forward(self, w):
         if not self.enabled:
             return w
-        scale, zp = weight_qparams(w, self.signed)
-        qmin, qmax = int_range(self.signed)
+        scale, zp = weight_qparams(w)
         if torch.onnx.is_in_onnx_export():
             scale = torch.tensor(scale.tolist(), dtype=torch.float32, device=w.device)  # constants, not traced ops
             zp = torch.tensor(zp.tolist(), dtype=torch.int32, device=w.device)
-            return torch.fake_quantize_per_channel_affine(w, scale, zp, 0, *onnx_range(self.signed))
-        return torch.fake_quantize_per_channel_affine(w, scale, zp, 0, qmin, qmax)
+        return torch.fake_quantize_per_channel_affine(w, scale, zp, 0, QMIN, QMAX)
 
 
 class QConv2d(nn.Module):
@@ -154,8 +137,8 @@ class QConv2d(nn.Module):
     def __init__(self, conv, cfg, out_q=False):
         super().__init__()
         self.conv = conv
-        self.wq = WeightFakeQuant(cfg.w_signed)
-        self.out_q = ActFakeQuant(cfg.act_signed) if out_q else None
+        self.wq = WeightFakeQuant()
+        self.out_q = ActFakeQuant() if out_q else None
         self.k230 = None  # K230 arithmetic emulation (k230_emul): None (off), "f16" or "sigmoid" output
 
     def forward(self, x):
@@ -245,9 +228,8 @@ def bake_weights(model):
             if isinstance(m, QConv2d) and m.wq.enabled:
                 w = m.conv.weight
                 saved.append((m, w.detach().clone()))
-                scale, zp = weight_qparams(w, m.wq.signed)
-                qmin, qmax = int_range(m.wq.signed)
-                w.copy_(torch.fake_quantize_per_channel_affine(w, scale, zp, 0, qmin, qmax))
+                scale, zp = weight_qparams(w)
+                w.copy_(torch.fake_quantize_per_channel_affine(w, scale, zp, 0, QMIN, QMAX))
                 m.wq.enabled = False
 
     def undo():

@@ -17,7 +17,7 @@ What it does:
 
 The range / scale / zero-point rules copy nncase (QuantUtility.GetQuantParam, FixupRange,
 GetWeightsRangesByChannel), so the numbers should match what the K230 compile path derives.
-Defaults: uint8 weights and uint8 activations (the nncase defaults).
+Weights and activations are uint8 (the nncase defaults; the int8 mode was removed).
 """
 import argparse
 import os
@@ -40,8 +40,6 @@ def main():
     ap.add_argument("--calib-images", type=int, default=512)
     ap.add_argument("--calib-batch-size", type=int, default=32)
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--act-type", choices=["u8", "s8"], default="u8")
-    ap.add_argument("--w-type", choices=["u8", "s8"], default="u8")
     ap.add_argument("--no-tie", action="store_true", help="do not share ranges at concats")
     ap.add_argument("--quant-head-outputs", action="store_true")
     ap.add_argument("--check-fold", action="store_true", help="compare FP32 and folded outputs")
@@ -62,8 +60,7 @@ def main():
         raise SystemExit("CUDA is required (the YOLOX evaluator uses CUDA tensors)")
     exp = get_exp(args.exp_file, args.name)
     exp.data_num_workers = args.workers
-    cfg = QuantConfig(act_signed=args.act_type == "s8", w_signed=args.w_type == "s8",
-                      quantize_head_outputs=args.quant_head_outputs, tie_concats=not args.no_tie)
+    cfg = QuantConfig(quantize_head_outputs=args.quant_head_outputs, tie_concats=not args.no_tie)
     print("config:", asdict(cfg))
     os.makedirs(args.out, exist_ok=True)
 

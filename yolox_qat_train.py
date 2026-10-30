@@ -106,7 +106,7 @@ def main():
     exp = get_exp(args.exp_file, args.name)
     exp.data_num_workers = args.workers
     ckpt = torch.load(args.resume or args.init, map_location="cpu", weights_only=False)
-    cfg = QuantConfig(**ckpt["cfg"])
+    cfg = QuantConfig.from_dict(ckpt["cfg"])
     print("config:", asdict(cfg))
     qat = build_model(exp, cfg)
     qat.load_state_dict(ckpt["model"])
