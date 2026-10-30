@@ -1,9 +1,9 @@
 """
 YOLOX specifics shared by run-model.py (K230 board) and run-onnx.py (onnxruntime): decoding, NMS and drawing.
 
-Expected model output: [1, N, 85] = (cx, cy, w, h, objectness, 80 class scores) per row; score = objectness * best
-class score. With --yolox-raw the box columns are the raw head values (dx, dy, log w, log h per grid cell, strides
-8/16/32) and are decoded here; otherwise they must already be pixels of the input image.
+Expected model output: the raw YOLOX head output [1, N, 85] = (dx, dy, log w, log h per grid cell, strides 8/16/32,
+objectness, 80 class scores) per row, as exported without box decoding (pth_to_onnx.py); the boxes are decoded here.
+score = objectness * best class score.
 
 draw_yolox() draws the boxes that survive --score-thr and class-aware NMS on the input image (colored by score, with
 the score to 3 decimals above each box) and writes <prefix>yolox.rgb: a raw tensor with exactly the layout, element
@@ -146,10 +146,9 @@ def draw_detections(hwc, dets, bgr=False):
 def add_arguments(parser):
     """Add the YOLOX options shared by run-model.py and run-onnx.py to an argparse parser."""
     parser.add_argument("--yolox", action="store_true",
-                        help="treat output 0 as YOLOX detections [1, N, 85], draw boxes on the input and save "
-                             "<prefix>yolox.rgb (raw, same layout and element type as the input)")
-    parser.add_argument("--yolox-raw", action="store_true",
-                        help="with --yolox: output is NOT decoded (dx, dy, log w, log h per grid cell)")
+                        help="treat output 0 as the raw YOLOX head output [1, N, 85] (dx, dy, log w, log h per grid "
+                             "cell), decode it, draw boxes on the input and save <prefix>yolox.rgb (raw, same layout "
+                             "and element type as the input)")
     parser.add_argument("--bgr", action="store_true",
                         help="with --yolox: the input tensor is in BGR order; draw the box colors in BGR as well")
     parser.add_argument("--score-thr", type=float, default=0.25,
@@ -159,7 +158,7 @@ def add_arguments(parser):
 
 
 def draw_yolox(args, data, out):
-    """Draw detections of the fused YOLOX output `out` on the input `data` and save raw RGB."""
+    """Decode the raw YOLOX output `out`, draw the detections on the input `data` and save raw RGB."""
     if data.dtype.kind not in "uf" or data.ndim != 4 or 3 not in (data.shape[1], data.shape[3]):
         print(f"error: --yolox needs an image input (1x3xHxW or 1xHxWx3, u8/u16/f16/f32), "
               f"got {data.dtype} {list(data.shape)}")
@@ -172,8 +171,7 @@ def draw_yolox(args, data, out):
     if det.shape[1] != 85:
         print(f"error: --yolox expects [N, 85] detections, output 0 has shape {list(out.shape)}")
         return 1
-    if args.yolox_raw:
-        det = decode_raw(det, hwc.shape[0])
+    det = decode_raw(det, hwc.shape[0])
     dets = detect(det, args.score_thr, args.nms_thr)
     print(f"\n{len(dets)} detection(s) with score >= {args.score_thr}:")
     for x1, y1, x2, y2, score, c in dets:

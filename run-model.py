@@ -12,8 +12,9 @@ The input file is raw bytes, with no header, laid out exactly as the model
 expects (e.g. 1x3x416x416 NCHW or 1x416x416x3 NHWC): its size must equal the
 model's input size. The expected shape and size are printed on error.
 
-With --yolox the first output is treated as fused YOLOX detections
-[1, N, 85] = (cx, cy, w, h in input pixels, objectness, 80 class scores);
+With --yolox the first output is treated as the raw YOLOX head output
+[1, N, 85] = (dx, dy, log w, log h per grid cell, objectness, 80 class
+scores), as exported by pth_to_onnx.py, and decoded to boxes;
 score = objectness * best class score. Boxes above --score-thr (after NMS)
 are drawn on the input image, colored by score, with the score (3 decimals)
 above each box. The result is written to <prefix>yolox.rgb as a raw tensor

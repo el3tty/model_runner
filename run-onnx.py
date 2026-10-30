@@ -6,17 +6,17 @@ The input file is raw little-endian bytes without a header, in the element type 
 (e.g. 1x3x416x416 f32, as written by tensor_from_image.py --type f32). Every output tensor is written to
 <prefix><index>.txt, one value per line (same format as run-model.py).
 
-With --yolox the first output is treated as YOLOX detections [1, N, 85] and the boxes are drawn on the input
+With --yolox the first output is treated as the raw YOLOX head output [1, N, 85] and the boxes are drawn on the input
 exactly like in run-model.py (same options); the result is saved as <prefix>yolox.rgb, a raw tensor with the layout
 and element type of the input, which tensor_to_image.py turns into an image.
 
 Usage:
     python run-onnx.py model.onnx input.in [--output-prefix output]
-                       [--yolox [--yolox-raw] [--bgr] [--score-thr 0.25] [--nms-thr 0.45]]
+                       [--yolox [--bgr] [--score-thr 0.25] [--nms-thr 0.45]]
 
 Example:
     python tensor_from_image.py test.jpg 416x416 --bgr --type f32 --output yolox-f32-bgr.in
-    python run-onnx.py yolox_nano.onnx yolox-f32-bgr.in --yolox --yolox-raw --bgr
+    python run-onnx.py yolox_nano.onnx yolox-f32-bgr.in --yolox --bgr
     python tensor_to_image.py outputyolox.rgb 416x416 f32 --bgr --output result.png
 """
 import argparse
