@@ -16,7 +16,7 @@ from yolox.exp import get_exp
 from yolox.models.network_blocks import BaseConv, Bottleneck, CSPLayer, DWConv, SPPBottleneck
 from yolox.utils import fuse_model
 
-from util import k230_emul, qat_generic
+from util import qat_generic
 from util.qat_generic import ActFakeQuant, QConv2d, QuantConfig, tie_ranges
 
 
@@ -32,11 +32,8 @@ class QBaseConv(nn.Module):
         self.conv = QConv2d(base.conv, cfg)
         self.act = base.act
         self.out_q = ActFakeQuant()
-        self.k230 = False  # K230 arithmetic emulation, see set_k230()
 
     def forward(self, x):
-        if self.k230:
-            return k230_emul.silu_quant(k230_emul.conv_f16(self.conv, x), self.out_q)
         return self.out_q(self.act(self.conv(x)))
 
 
@@ -47,30 +44,12 @@ class QBottleneck(nn.Module):
         self.conv2 = b.conv2
         self.use_add = b.use_add
         self.add_q = ActFakeQuant() if b.use_add else None
-        self.k230 = False  # K230 arithmetic emulation, see set_k230()
 
     def forward(self, x):
         y = self.conv2(self.conv1(x))
         if self.use_add:
-            y = k230_emul.add_quant(y, x, self.add_q) if self.k230 else self.add_q(y + x)
+            y = self.add_q(y + x)
         return y
-
-
-def set_k230(model, on=True):
-    """Switch the K230 arithmetic emulation (util/k230_emul.py) of a make_quantizable() model on or off: PWL SiLU
-    with folded output quantization and f16 intermediates in every QBaseConv / residual add, f16 head convs and the
-    PWL sigmoid on the objectness / class outputs. Use it with the quantizers enabled (set_state)."""
-    for m in model.modules():
-        if isinstance(m, QBaseConv):
-            if on and not isinstance(m.act, nn.SiLU):
-                raise ValueError(f"K230 emulation only models SiLU activations, got {type(m.act).__name__}")
-            m.k230 = on
-        elif isinstance(m, QBottleneck):
-            m.k230 = on
-    head = model.head
-    for lst, kind in ((head.reg_preds, "f16"), (head.obj_preds, "sigmoid"), (head.cls_preds, "sigmoid")):
-        for conv in lst:
-            conv.k230 = kind if on else None
 
 
 # ----------------------------------------------------------------------------------------------------------------------

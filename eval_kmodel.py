@@ -8,9 +8,9 @@ QAT checkpoint on exactly the same input tensors.
 2. on the board (run-coco.py, numpy + nncaseruntime only):
        python run-coco.py yolox-qat.kmodel coco-val dets-yolox-qat
 3. eval: decode the kmodel's candidate rows with the YOLOX head, the YOLOX postprocess (test_conf, NMS) and COCOeval
-   restricted to the prepared images; --ckpt also evaluates the QAT checkpoint on the same tensors in the PyTorch modes
-   of eval_k230.py (float, qdq, k230):
-       python eval_kmodel.py eval coco-val dets-yolox-qat.npz --ckpt ../qat-run/best.pth --modes qdq,k230
+   restricted to the prepared images; --ckpt also evaluates the QAT checkpoint on the same tensors in PyTorch, with
+   the quantizers off (float) and/or on (qdq, = the exported QDQ ONNX model):
+       python eval_kmodel.py eval coco-val dets-yolox-qat.npz --ckpt ../qat-run/best.pth --modes float,qdq
 
 Needs torch, pycocotools and the yolox package with COCO in YOLOX_DATADIR (or yolox's datasets/COCO); --ckpt needs a
 CUDA device.
@@ -115,7 +115,7 @@ def evaluate(args):
         results[label] = coco_ap(ds, dets, ids)
 
     if args.ckpt:
-        from eval_k230 import set_mode
+        from util.qat_generic import set_state
         from util.qat_yolox import load_qat_checkpoint
 
         torch.backends.cudnn.allow_tf32 = False
@@ -123,12 +123,15 @@ def evaluate(args):
         _, model, _, _ = load_qat_checkpoint(args.ckpt, args.name, args.exp_file)
         model.cuda().eval()
         modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+        for m in modes:
+            if m not in ("float", "qdq"):
+                raise SystemExit(f"unknown mode {m!r} (use float, qdq)")
         dets = {m: [] for m in modes}
         for info in images:
             x = np.fromfile(os.path.join(args.dir, f"{info['id']}.u8"), np.uint8).reshape(1, 3, h, w)
             x = torch.from_numpy(x.astype(np.float32)).cuda()
             for m in modes:
-                set_mode(model, m)
+                set_state(model, weights=m == "qdq", acts=m == "qdq", observe=False)
                 dets[m] += finish(model(x).float().cpu(), True, info, info["id"])
         for m in modes:
             results[f"{os.path.basename(args.ckpt)} {m}"] = coco_ap(ds, dets[m], ids)
@@ -150,7 +153,8 @@ def main():
     e.add_argument("dir", help="the directory written by prepare (index.json, *.u8)")
     e.add_argument("dets", nargs="*", help="<out>.npz files written by run-coco.py")
     e.add_argument("--ckpt", default=None, help="QAT checkpoint to evaluate on the same tensors (needs CUDA)")
-    e.add_argument("--modes", default="qdq,k230", help="PyTorch modes for --ckpt (float, qdq, k230)")
+    e.add_argument("--modes", default="qdq", help="PyTorch modes for --ckpt, comma separated: float, qdq "
+                                                  "(default: qdq)")
     args = ap.parse_args()
     if args.cmd == "prepare":
         prepare(args)

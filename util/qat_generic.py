@@ -139,15 +139,8 @@ class QConv2d(nn.Module):
         self.conv = conv
         self.wq = WeightFakeQuant()
         self.out_q = ActFakeQuant() if out_q else None
-        self.k230 = None  # K230 arithmetic emulation (k230_emul): None (off), "f16" or "sigmoid" output
 
     def forward(self, x):
-        if self.k230:
-            from util import k230_emul
-            y = k230_emul.conv_f16(self, x)
-            if self.out_q is not None:
-                y = self.out_q(y)
-            return k230_emul.sigmoid_logit(y) if self.k230 == "sigmoid" else y
         c = self.conv
         y = F.conv2d(x, self.wq(c.weight), c.bias, c.stride, c.padding, c.dilation, c.groups)
         return self.out_q(y) if self.out_q is not None else y
