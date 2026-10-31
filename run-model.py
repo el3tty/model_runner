@@ -19,8 +19,9 @@ score = objectness * best class score. Boxes above --score-thr (after NMS)
 are drawn on the input image, colored by score, with the score (3 decimals)
 above each box. The result is written to <prefix>yolox.rgb as a raw tensor
 with exactly the layout, element type and size of the input (e.g. 1x3x416x416).
-Input may be u8, u16, f16 or f32 (as the model expects); pixel values are
-assumed to be in 0..255 for every type.
+Input may be u8, u16, f16 or f32 (as the model expects), in BGR channel
+order (as YOLOX expects); pixel values are assumed to be in 0..255 for
+every type.
 
 Usage:
     python nncaseruntime_test.py model.kmodel input.u8 [--output-prefix output]

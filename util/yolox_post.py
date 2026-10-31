@@ -7,8 +7,8 @@ score = objectness * best class score.
 
 draw_yolox() draws the boxes that survive --score-thr and class-aware NMS on the input image (colored by score, with
 the score to 3 decimals above each box) and writes <prefix>yolox.rgb: a raw tensor with exactly the layout, element
-type and size of the input. Input may be u8, u16, f16 or f32 as 1x3xHxW or 1xHxWx3; pixel values are assumed to be in
-0..255 for every type. tensor_to_image.py turns the result into an image.
+type and size of the input. Input may be u8, u16, f16 or f32 as 1x3xHxW or 1xHxWx3, in BGR channel order (as YOLOX
+expects); pixel values are assumed to be in 0..255 for every type. tensor_to_image.py turns the result into an image.
 """
 import os
 
@@ -130,10 +130,11 @@ def draw_text(img, x, y, text, color, bg=(0, 0, 0), scale=2):
                     img[py:py + scale, px:px + scale] = color  # numpy clips slices at the border
 
 
-def draw_detections(hwc, dets, bgr=False):
+def draw_detections(hwc, dets):
+    """hwc: BGR image (the YOLOX input order), so the RGB drawing colors are swapped."""
     img = hwc.copy()
     for x1, y1, x2, y2, score, _ in dets:
-        color = score_color(score)[::-1] if bgr else score_color(score)  # BGR input: swap the drawing colors too
+        color = score_color(score)[::-1]
         draw_rect(img, x1, y1, x2, y2, color)
         label_h = 5 * 2 + 4
         ty = int(round(y1)) - label_h
@@ -147,10 +148,8 @@ def add_arguments(parser):
     """Add the YOLOX options shared by run-model.py and run-onnx.py to an argparse parser."""
     parser.add_argument("--yolox", action="store_true",
                         help="treat output 0 as the raw YOLOX head output [1, N, 85] (dx, dy, log w, log h per grid "
-                             "cell), decode it, draw boxes on the input and save <prefix>yolox.rgb (raw, same layout "
-                             "and element type as the input)")
-    parser.add_argument("--bgr", action="store_true",
-                        help="with --yolox: the input tensor is in BGR order; draw the box colors in BGR as well")
+                             "cell), decode it, draw boxes on the input (BGR, as YOLOX expects) and save "
+                             "<prefix>yolox.rgb (raw, same layout, channel order and element type as the input)")
     parser.add_argument("--score-thr", type=float, default=0.25,
                         help="with --yolox: minimum objectness*class score (default 0.25)")
     parser.add_argument("--nms-thr", type=float, default=0.45,
@@ -177,7 +176,7 @@ def draw_yolox(args, data, out):
     for x1, y1, x2, y2, score, c in dets:
         name = COCO[c] if c < len(COCO) else str(c)
         print(f"  {score:.3f}  class {c:2d} {name:<14s} box ({x1:.0f}, {y1:.0f}) - ({x2:.0f}, {y2:.0f})")
-    img = draw_detections(hwc, dets, args.bgr)
+    img = draw_detections(hwc, dets)
     if data.dtype != np.uint8:
         # keep the untouched pixels exactly as they were in the input; only the drawn ones are replaced
         drawn = (img != hwc).any(axis=2)

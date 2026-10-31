@@ -12,11 +12,11 @@ and element type of the input, which tensor_to_image.py turns into an image.
 
 Usage:
     python run-onnx.py model.onnx input.in [--output-prefix output]
-                       [--yolox [--bgr] [--score-thr 0.25] [--nms-thr 0.45]]
+                       [--yolox [--score-thr 0.25] [--nms-thr 0.45]]
 
 Example:
     python tensor_from_image.py test.jpg 416x416 --bgr --type f32 --output yolox-f32-bgr.in
-    python run-onnx.py yolox_nano.onnx yolox-f32-bgr.in --yolox --bgr
+    python run-onnx.py yolox_nano.onnx yolox-f32-bgr.in --yolox
     python tensor_to_image.py outputyolox.rgb 416x416 f32 --bgr --output result.png
 """
 import argparse
