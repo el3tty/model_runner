@@ -5,7 +5,7 @@
 
 This is the reverse of tensor_from_image.py: the file has no header, is little-endian and holds
 1 x 3 x H x W values (RGB) of the given type. Pixel values are expected in the 0..255 range for every type
-(no normalisation); they are rounded and clipped to u8.
+(no normalisation), or 0..1 with --range 1; they are rounded and clipped to u8.
 
 Arguments:
     tensor       raw tensor file
@@ -14,6 +14,7 @@ Arguments:
 
 Options:
     --bgr        the tensor holds BGR channels (as made by tensor_from_image.py --bgr)
+    --range      pixel value range: 255 (default, 0..255) or 1 (0..1, as made by tensor_from_image.py --range 1)
     --layout     nchw (default, 1x3xHxW) or nhwc (1xHxWx3)
     --format     png, jpg or bmp. Default: taken from the --output extension, otherwise png
     --output     output file. Default: the tensor path with the extension replaced by the format's extension
@@ -46,6 +47,8 @@ def main():
     ap.add_argument("dtype", nargs="?", default="u8", choices=sorted(DTYPES), help="element type (default: u8)")
     ap.add_argument("--layout", choices=("nchw", "nhwc"), default="nchw", help="tensor layout (default: nchw)")
     ap.add_argument("--bgr", action="store_true", help="the tensor channels are in BGR order (swap to RGB for the image)")
+    ap.add_argument("--range", dest="vrange", type=int, choices=(255, 1), default=255,
+                    help="pixel value range 0..255 (default) or 0..1")
     ap.add_argument("--format", dest="fmt", choices=sorted(FORMATS), default=None,
                     help="image format (default: from the --output extension, else png)")
     ap.add_argument("--output", type=Path, default=None, help="output file")
@@ -74,13 +77,14 @@ def main():
     if args.bgr:
         hwc = hwc[:, :, ::-1]
     lo, hi = float(hwc.min()), float(hwc.max())
-    img = Image.fromarray(np.clip(np.rint(hwc.astype(np.float32)), 0, 255).astype(np.uint8), "RGB")
+    img = Image.fromarray(np.clip(np.rint(hwc.astype(np.float32) * (255.0 / args.vrange)), 0, 255).astype(np.uint8),
+                          "RGB")
 
     kw = {"quality": args.quality, "subsampling": 0} if FORMATS[fmt] == "JPEG" else {}
     img.save(out, FORMATS[fmt], **kw)
     print(f"{args.tensor} ({args.dtype}, value range {lo:g}..{hi:g}) -> {out} ({fmt}, {w}x{h})")
-    if hi <= 1.0 and args.dtype in ("f16", "f32"):
-        print("warning: all values are <= 1.0; if the tensor is normalised to 0..1 the image will look black")
+    if args.vrange == 255 and hi <= 1.0 and args.dtype in ("f16", "f32"):
+        print("warning: all values are <= 1.0; if the tensor is normalised to 0..1 use --range 1")
 
 
 if __name__ == "__main__":

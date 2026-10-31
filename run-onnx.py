@@ -6,18 +6,26 @@ The input file is raw little-endian bytes without a header, in the element type 
 (e.g. 1x3x416x416 f32, as written by tensor_from_image.py --type f32). Every output tensor is written to
 <prefix><index>.txt, one value per line (same format as run-model.py).
 
-With --yolox the first output is treated as the raw YOLOX head output [1, N, 85] and the boxes are drawn on the input
-exactly like in run-model.py (same options); the result is saved as <prefix>yolox.rgb, a raw tensor with the layout
-and element type of the input, which tensor_to_image.py turns into an image.
+With --detect yolox|yolov3|yolo-fastest the outputs are treated as the raw heads of that detector (util/yolo_post.py)
+and the boxes are drawn on the input exactly like in run-model.py (same options); the result is saved as
+<prefix><detect>.rgb, a raw tensor with the layout and element type of the input, which tensor_to_image.py turns into
+an image.
 
 Usage:
     python run-onnx.py model.onnx input.in [--output-prefix output]
-                       [--yolox [--score-thr 0.25] [--nms-thr 0.45]]
+                       [--detect yolox|yolov3|yolo-fastest [--score-thr 0.25] [--nms-thr 0.45]]
 
-Example:
+Examples:
     python tensor_from_image.py test.jpg 416x416 --bgr --type f32 --output yolox-f32-bgr.in
-    python run-onnx.py yolox_nano.onnx yolox-f32-bgr.in --yolox
+    python run-onnx.py yolox_nano.onnx yolox-f32-bgr.in --detect yolox
     python tensor_to_image.py outputyolox.rgb 416x416 f32 --bgr --output result.png
+
+    python tensor_from_image.py test.jpg 416x416 --letterbox --pad 128 --range 1 --type f32 --output yolov3.in
+    python run-onnx.py yolov3-12-int8-heads.onnx yolov3.in --detect yolov3
+    python tensor_to_image.py outputyolov3.rgb 416x416 f32 --range 1 --output result.png
+
+    python tensor_from_image.py test.jpg 320x320 --range 1 --type f32 --output fastest.in
+    python run-onnx.py yolo-fastest-1.1-320_int8_qop.onnx fastest.in --detect yolo-fastest
 """
 import argparse
 import os
@@ -25,7 +33,7 @@ import sys
 
 import numpy as np
 
-from util import yolox_post
+from util import yolo_post
 from util.common import save_tensor_text
 
 ORT_TYPES = {"tensor(float)": np.float32, "tensor(float16)": np.float16, "tensor(uint8)": np.uint8,
@@ -38,9 +46,9 @@ def parse_args():
     ap.add_argument("model", help="path to the .onnx file")
     ap.add_argument("input", help="raw input tensor file (element type and layout as the model expects)")
     ap.add_argument("--output-prefix", default="output",
-                    help="output tensors are saved as <prefix>0.txt, ...; --yolox writes <prefix>yolox.rgb "
+                    help="output tensors are saved as <prefix>0.txt, ...; --detect writes <prefix><detect>.rgb "
                          "(default: output)")
-    yolox_post.add_arguments(ap)
+    yolo_post.add_arguments(ap)
     return ap.parse_args()
 
 
@@ -80,8 +88,8 @@ def main():
         save_tensor_text(path, out)
         print(f"  saved {os.path.abspath(path)} ({out.size} values)")
 
-    if args.yolox:
-        return yolox_post.draw_yolox(args, data, outs[0])
+    if args.detect:
+        return yolo_post.draw(args, data, outs)
     return 0
 
 

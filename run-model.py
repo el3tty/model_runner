@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YOLOX-nano (416x416) kmodel test for the nncaseruntime K230 extension.
+kmodel runner for the nncaseruntime K230 extension (board or simulator), with YOLO box drawing.
 
 Loads a kmodel, feeds it a raw uint8 tensor read from a file, runs one
 inference and writes each output tensor to <prefix><index>.txt, one value per
@@ -12,24 +12,22 @@ The input file is raw bytes, with no header, laid out exactly as the model
 expects (e.g. 1x3x416x416 NCHW or 1x416x416x3 NHWC): its size must equal the
 model's input size. The expected shape and size are printed on error.
 
-With --yolox the first output is treated as the raw YOLOX head output
-[1, N, 85] = (dx, dy, log w, log h per grid cell, objectness, 80 class
-scores), as exported by pth_to_onnx.py, and decoded to boxes;
+With --detect yolox|yolov3|yolo-fastest the outputs are treated as the raw
+heads of that detector and decoded to boxes (util/yolo_post.py, which also
+gives the input channel order and value range each detector expects);
 score = objectness * best class score. Boxes above --score-thr (after NMS)
 are drawn on the input image, colored by score, with the score (3 decimals)
-above each box. The result is written to <prefix>yolox.rgb as a raw tensor
+above each box. The result is written to <prefix><detect>.rgb as a raw tensor
 with exactly the layout, element type and size of the input (e.g. 1x3x416x416).
-Input may be u8, u16, f16 or f32 (as the model expects), in BGR channel
-order (as YOLOX expects); pixel values are assumed to be in 0..255 for
-every type.
+Input may be u8, u16, f16 or f32 (as the model expects).
 
 Usage:
-    python nncaseruntime_test.py model.kmodel input.u8 [--output-prefix output]
-                                 [--dump-root rt-dumps] [--yolox]
+    python run-model.py model.kmodel input.in [--output-prefix output]
+                        [--dump-root rt-dumps] [--detect yolox|yolov3|yolo-fastest]
 
 Example:
-    python nncaseruntime_test.py yolox_nano_416.kmodel image_416.u8 --output-prefix out_
-    # -> out_0.txt, out_1.txt, ...
+    python run-model.py yolox-qat.kmodel yolox-f32-bgr.in --output-prefix out_ --detect yolox
+    # -> out_0.txt, out_1.txt, ..., out_yolox.rgb
 """
 
 import argparse
@@ -40,7 +38,7 @@ import time
 import numpy as np
 import nncaseruntime as nn
 
-from util import yolox_post
+from util import yolo_post
 from util.common import save_tensor_text
 
 
@@ -60,7 +58,7 @@ class ScopedTiming:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="YOLOX-nano kmodel runner")
+    parser = argparse.ArgumentParser(description="kmodel runner")
     parser.add_argument("kmodel", help="path to the .kmodel file")
     parser.add_argument("input", help="raw input tensor file (element type and layout as the model expects, e.g. u8 or f32)")
     parser.add_argument("--output-prefix", default="output",
@@ -68,7 +66,7 @@ def parse_args():
                              "<prefix>1.txt, ... (default: output)")
     parser.add_argument("--dump-root", default="rt-dumps",
                         help="folder for runtime dumps (default: rt-dumps)")
-    yolox_post.add_arguments(parser)
+    yolo_post.add_arguments(parser)
     return parser.parse_args()
 
 
@@ -122,11 +120,10 @@ def main():
     out_dir = os.path.dirname(args.output_prefix)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    out0 = None
+    outs = []
     for i in range(kpu.outputs_size):
         out = kpu.get_output_tensor(i).to_numpy()
-        if i == 0:
-            out0 = out
+        outs.append(out)
         print(f"output[{i}]: shape={list(out.shape)}, dtype={out.dtype}, "
               f"min={out.min():.6f}, max={out.max():.6f}, "
               f"mean={out.mean():.6f}")
@@ -134,8 +131,8 @@ def main():
         save_tensor_text(path, out)
         print(f"  saved {os.path.abspath(path)} ({out.size} values)")
 
-    if args.yolox:
-        return yolox_post.draw_yolox(args, data, out0)
+    if args.detect:
+        return yolo_post.draw(args, data, outs)
     return 0
 
 
