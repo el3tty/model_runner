@@ -3,8 +3,9 @@
 kmodel runner for the nncaseruntime K230 extension (board or simulator), with YOLO box drawing.
 
 Loads a kmodel, feeds it a raw uint8 tensor read from a file, runs one
-inference and writes each output tensor to <prefix><index>.txt, one value per
-line (row-major order). Runtime dumps (text/rdata/in/out etc., if the runtime was built
+inference and prints a summary of each output tensor; with --dump-outputs it
+also writes each output to <prefix><index>.txt, one value per line (row-major
+order). Runtime dumps (text/rdata/in/out etc., if the runtime was built
 with DUMP_K230_INVOCATIONS / ENABLE_DUMP_MANAGER) go to a separate folder
 instead of the current directory.
 
@@ -22,11 +23,11 @@ with exactly the layout, element type and size of the input (e.g. 1x3x416x416).
 Input may be u8, u16, f16 or f32 (as the model expects).
 
 Usage:
-    python run-model.py model.kmodel input.in [--output-prefix output]
+    python run-model.py model.kmodel input.in [--output-prefix output] [--dump-outputs]
                         [--dump-root rt-dumps] [--detect yolox|yolov3|yolo-fastest]
 
 Example:
-    python run-model.py yolox-qat.kmodel yolox-f32-bgr.in --output-prefix out_ --detect yolox
+    python run-model.py yolox-qat.kmodel yolox-f32-bgr.in --output-prefix out_ --detect yolox --dump-outputs
     # -> out_0.txt, out_1.txt, ..., out_yolox.rgb
 """
 
@@ -62,8 +63,10 @@ def parse_args():
     parser.add_argument("kmodel", help="path to the .kmodel file")
     parser.add_argument("input", help="raw input tensor file (element type and layout as the model expects, e.g. u8 or f32)")
     parser.add_argument("--output-prefix", default="output",
-                        help="output tensors are saved as <prefix>0.txt, "
-                             "<prefix>1.txt, ... (default: output)")
+                        help="prefix of the files written: <prefix>0.txt, <prefix>1.txt, ... with --dump-outputs, "
+                             "<prefix><detect>.rgb with --detect (default: output)")
+    parser.add_argument("--dump-outputs", action="store_true",
+                        help="save each output tensor as text, <prefix><index>.txt, one value per line")
     parser.add_argument("--dump-root", default="rt-dumps",
                         help="folder for runtime dumps (default: rt-dumps)")
     yolo_post.add_arguments(parser)
@@ -116,7 +119,7 @@ def main():
     with ScopedTiming("run"):
         kpu.run()
 
-    # Outputs: print a summary and save each tensor as <prefix><i>.txt.
+    # Outputs: print a summary and, with --dump-outputs, save each tensor as <prefix><i>.txt.
     out_dir = os.path.dirname(args.output_prefix)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -127,9 +130,10 @@ def main():
         print(f"output[{i}]: shape={list(out.shape)}, dtype={out.dtype}, "
               f"min={out.min():.6f}, max={out.max():.6f}, "
               f"mean={out.mean():.6f}")
-        path = f"{args.output_prefix}{i}.txt"
-        save_tensor_text(path, out)
-        print(f"  saved {os.path.abspath(path)} ({out.size} values)")
+        if args.dump_outputs:
+            path = f"{args.output_prefix}{i}.txt"
+            save_tensor_text(path, out)
+            print(f"  saved {os.path.abspath(path)} ({out.size} values)")
 
     if args.detect:
         return yolo_post.draw(args, data, outs)

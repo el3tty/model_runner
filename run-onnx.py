@@ -3,8 +3,8 @@
 Run an ONNX model (onnxruntime, CPU) on a raw input tensor file - the float reference for run-model.py.
 
 The input file is raw little-endian bytes without a header, in the element type and layout of the model input
-(e.g. 1x3x416x416 f32, as written by tensor_from_image.py --type f32). Every output tensor is written to
-<prefix><index>.txt, one value per line (same format as run-model.py).
+(e.g. 1x3x416x416 f32, as written by tensor_from_image.py --type f32). A summary of every output tensor is printed;
+with --dump-outputs each one is also written to <prefix><index>.txt, one value per line (same format as run-model.py).
 
 With --detect yolox|yolov3|yolo-fastest the outputs are treated as the raw heads of that detector (util/yolo_post.py)
 and the boxes are drawn on the input exactly like in run-model.py (same options); the result is saved as
@@ -12,7 +12,7 @@ and the boxes are drawn on the input exactly like in run-model.py (same options)
 an image.
 
 Usage:
-    python run-onnx.py model.onnx input.in [--output-prefix output]
+    python run-onnx.py model.onnx input.in [--output-prefix output] [--dump-outputs]
                        [--detect yolox|yolov3|yolo-fastest [--score-thr 0.25] [--nms-thr 0.45]]
 
 Examples:
@@ -46,8 +46,10 @@ def parse_args():
     ap.add_argument("model", help="path to the .onnx file")
     ap.add_argument("input", help="raw input tensor file (element type and layout as the model expects)")
     ap.add_argument("--output-prefix", default="output",
-                    help="output tensors are saved as <prefix>0.txt, ...; --detect writes <prefix><detect>.rgb "
-                         "(default: output)")
+                    help="prefix of the files written: <prefix>0.txt, ... with --dump-outputs, <prefix><detect>.rgb "
+                         "with --detect (default: output)")
+    ap.add_argument("--dump-outputs", action="store_true",
+                    help="save each output tensor as text, <prefix><index>.txt, one value per line")
     yolo_post.add_arguments(ap)
     return ap.parse_args()
 
@@ -84,9 +86,10 @@ def main():
     for i, out in enumerate(outs):
         print(f"output[{i}]: shape={list(out.shape)}, dtype={out.dtype}, "
               f"min={out.min():.6f}, max={out.max():.6f}, mean={out.mean():.6f}")
-        path = f"{args.output_prefix}{i}.txt"
-        save_tensor_text(path, out)
-        print(f"  saved {os.path.abspath(path)} ({out.size} values)")
+        if args.dump_outputs:
+            path = f"{args.output_prefix}{i}.txt"
+            save_tensor_text(path, out)
+            print(f"  saved {os.path.abspath(path)} ({out.size} values)")
 
     if args.detect:
         return yolo_post.draw(args, data, outs)
