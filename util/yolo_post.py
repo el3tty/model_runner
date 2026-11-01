@@ -9,6 +9,10 @@ drawing, for the detector heads selected with --detect:
                 gray 128 padding).
   yolo-fastest  the two raw heads of Yolo-Fastest 1.1 (darknet, yolo-fastest-1.1.cfg): [1, 255, H/s, W/s] for strides
                 16 and 32. Input RGB, 0..1 (plain resize).
+  yolo26        the raw one-to-many head of Ultralytics YOLO26 (yolo26_to_onnx.py): per stride 8, 16, 32 a box map
+                [1, 4, H/s, W/s] = (l, t, r, b) distances from the cell center in strides (no DFL) and a class map
+                [1, 80, H/s, W/s] of logits (no objectness; decoded with objectness 1). Input RGB, 0..255 (letterbox
+                centered, pad 114).
 
 The anchor heads hold 3 anchors x (tx, ty, tw, th, objectness, 80 class logits) per cell and are decoded as in darknet:
 cx = (sigmoid(tx) + col) * stride, w = exp(tw) * anchor_w (likewise y, h), sigmoid on objectness and classes. Every
@@ -58,6 +62,45 @@ def decode_yolox(outs, h, w, _anchors):
     return out
 
 
+def join_split(outs):
+    """YOLO26 box [1, 4, h, w] and class [1, 80, h, w] maps (any order) -> one [1, 84, h, w] per stride, finest grid
+    first. Already joined outputs are returned as they are."""
+    if all(o.shape[1] != 4 for o in outs):
+        return list(outs)
+    by_grid = {}
+    for o in outs:
+        by_grid.setdefault(tuple(o.shape[2:]), {})["box" if o.shape[1] == 4 else "cls"] = o
+    joined = []
+    for g in sorted(by_grid, key=lambda g: -g[0] * g[1]):
+        pair = by_grid[g]
+        if set(pair) != {"box", "cls"}:
+            raise ValueError(f"grid {g}: expected one box map (4 channels) and one class map, got {sorted(pair)}")
+        joined.append(np.concatenate((pair["box"], pair["cls"]), 1))
+    return joined
+
+
+def decode_yolo26(outs, h, w, _anchors):
+    """Raw YOLO26 one-to-many head (6 box / class maps, or the 3 joined [1, 84, H/s, W/s] of join_split)."""
+    rows = []
+    for out in join_split(outs):
+        gh, gw = out.shape[2:]
+        stride = h // gh
+        if stride != w // gw or h % gh or w % gw:
+            raise ValueError(f"output {list(out.shape)} does not fit a {w}x{h} input")
+        t = out[0].astype(np.float32).reshape(out.shape[1], -1).T  # [gh*gw, 84]
+        ys, xs = np.meshgrid(np.arange(gh) + 0.5, np.arange(gw) + 0.5, indexing="ij")
+        ax, ay = xs.reshape(-1), ys.reshape(-1)
+        x1, y1, x2, y2 = ax - t[:, 0], ay - t[:, 1], ax + t[:, 2], ay + t[:, 3]
+        d = np.empty((len(t), 85), np.float32)
+        d[:, 0], d[:, 1] = (x1 + x2) / 2 * stride, (y1 + y2) / 2 * stride
+        d[:, 2], d[:, 3] = (x2 - x1) * stride, (y2 - y1) * stride
+        d[:, 4] = 1.0
+        with np.errstate(over="ignore"):
+            d[:, 5:] = sigmoid(t[:, 4:])
+        rows.append(d)
+    return np.concatenate(rows)
+
+
 def decode_anchors(outs, h, w, anchors):
     """Raw darknet / keras-yolo3 heads [1, A*85, H/s, W/s], logits everywhere; anchors: {stride: [(aw, ah), ...]}."""
     rows, strides = [], []
@@ -96,6 +139,7 @@ MODELS = {
     # yolo-fastest-1.1.cfg: anchors 12,18 37,49 52,132 115,73 119,199 242,238; masks 3,4,5 (10x10) and 0,1,2 (20x20)
     "yolo-fastest": dict(decode=decode_anchors, bgr=False, white=1.0,
                          anchors={16: [(12, 18), (37, 49), (52, 132)], 32: [(115, 73), (119, 199), (242, 238)]}),
+    "yolo26": dict(decode=decode_yolo26, bgr=False, white=255.0, anchors=None),
 }
 
 # ----------------------------------------------------------------------------
@@ -209,7 +253,8 @@ def add_arguments(parser):
     parser.add_argument("--detect", choices=sorted(MODELS), default=None,
                         help="decode the outputs as raw heads of this detector, draw the boxes on the input and save "
                              "<prefix><detect>.rgb (raw, same layout, channel order, value range and element type as "
-                             "the input); yolox: BGR 0..255 input, yolov3 / yolo-fastest: RGB 0..1")
+                             "the input); yolox: BGR 0..255 input, yolov3 / yolo-fastest: RGB 0..1, yolo26: RGB "
+                             "0..255")
     parser.add_argument("--score-thr", type=float, default=0.25,
                         help="with --detect: minimum objectness*class score (default 0.25)")
     parser.add_argument("--nms-thr", type=float, default=0.45,

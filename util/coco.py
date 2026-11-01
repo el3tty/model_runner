@@ -11,14 +11,15 @@ Prepared input folder (coco_prepare.py):
                     ((x - dx) / sx, (y - dy) / sy)
 
 Candidate file (coco_run.py, <name>.npz): the raw outputs are cut into cells of 85 values (a YOLOX row, or one anchor
-of an anchor-head grid cell, as cells() lays them out) and only the cells whose score objectness * best class score can
-reach --conf are kept:
+of an anchor-head grid cell, as cells() lays them out; for YOLO26 the box and class maps of a stride are first joined
+into one [1, 84, H, W] output, yolo_post.join_split, and a cell is one grid position) and only the cells whose score
+objectness * best class score can reach --conf are kept:
     model, conf    the --detect name and the threshold
     ids [M]        image ids
     shape<o>       shape of output o
     rows<o> [M]    number of cells of output o kept per image
     index<o> [R]   cell index within output o (int32)
-    values<o> [R, 85]  the raw cell values (float16)
+    values<o> [R, 85]  the raw cell values (float16; [R, 84] for YOLO26)
 """
 import json
 import os
@@ -31,7 +32,9 @@ from util import yolo_post
 #   size       model input (W, H)
 #   letterbox  "topleft" (YOLOX: resized image in the top-left corner), "center" (keras-yolo3) or None (stretch)
 #   pad        padding gray value
-#   resample   resize method: "cv2-linear" (cv2.INTER_LINEAR, BGR image as read by cv2) or "pil-bicubic"
+#   resample   resize method: "cv2-linear" (cv2.INTER_LINEAR, BGR image as read by cv2), "cv2-ultralytics"
+#              (Ultralytics val: long side to size with INTER_AREA when shrinking, INTER_LINEAR when enlarging) or
+#              "pil-bicubic"
 #   conf, nms  candidate score threshold and NMS IoU of the reference evaluations (YOLOX test_conf / nmsthre,
 #              darknet detector map)
 #   multi_label  one detection per class above conf (darknet, keras-yolo3) instead of the best class only (YOLOX)
@@ -42,16 +45,27 @@ PREP = {
                    multi_label=True),
     "yolo-fastest": dict(size=(320, 320), letterbox=None, pad=0, resample="cv2-linear", conf=0.005, nms=0.45,
                          multi_label=True),
+    # Ultralytics val defaults (conf 0.001, iou 0.7, multi-label), but square 640 input instead of rect batches
+    "yolo26": dict(size=(640, 640), letterbox="center", pad=114, resample="cv2-ultralytics", conf=0.001, nms=0.7,
+                   multi_label=True),
 }
 
 # Fill value of the cells that coco_run.py dropped: YOLOX scores are already probabilities (0 -> score 0), anchor
-# heads are logits (-80 -> sigmoid ~ 0, exp ~ 0, and exp(80) still fits in float32).
-EMPTY = {"rows": 0.0, "grid": -80.0}
+# heads and YOLO26 are logits (-80 -> sigmoid ~ 0, exp ~ 0, and exp(80) still fits in float32).
+EMPTY = {"rows": 0.0, "grid": -80.0, "dense": -80.0}
 
 
 def kind(model):
-    """'rows' for a [1, N, 85] head (YOLOX), 'grid' for [1, A*85, H/s, W/s] anchor heads."""
+    """'rows' for a [1, N, 85] head (YOLOX), 'grid' for [1, A*85, H/s, W/s] anchor heads, 'dense' for the joined
+    [1, 84, H/s, W/s] YOLO26 outputs (4 box distances + 80 class logits per grid position, no objectness)."""
+    if model == "yolo26":
+        return "dense"
     return "rows" if yolo_post.MODELS[model]["anchors"] is None else "grid"
+
+
+def group(outs, model):
+    """The raw model outputs as cut into cells: YOLO26 box / class maps joined per stride, others unchanged."""
+    return yolo_post.join_split(outs) if kind(model) == "dense" else outs
 
 
 # ----------------------------------------------------------------------------
@@ -62,7 +76,7 @@ def preprocess(path, model):
     """Image file -> (uint8 1x3xHxW tensor in the model's channel order, geometry dict sx, sy, dx, dy)."""
     p = PREP[model]
     w, h = p["size"]
-    if p["resample"] == "cv2-linear":
+    if p["resample"].startswith("cv2-"):
         import cv2
 
         img = cv2.imread(path)  # BGR
@@ -78,6 +92,16 @@ def preprocess(path, model):
             out = np.full((h, w, 3), p["pad"], np.uint8)
             out[:img.shape[0], :img.shape[1]] = img
             geo = dict(sx=r0, sy=r0, dx=0.0, dy=0.0)  # YOLOX maps back with min(H / ih, W / iw)
+        elif p["resample"] == "cv2-ultralytics" and p["letterbox"] == "center":
+            # Ultralytics BaseDataset.load_image (long side -> size), then LetterBox(center=True), no further resize
+            r = min(w, h) / max(ih, iw)
+            nw, nh = min(int(np.ceil(iw * r)), w), min(int(np.ceil(ih * r)), h)
+            interp = cv2.INTER_LINEAR if r > 1 else cv2.INTER_AREA
+            img = cv2.resize(img, (nw, nh), interpolation=interp) if (nw, nh) != (iw, ih) else img
+            top, left = round((h - nh) / 2 - 0.1), round((w - nw) / 2 - 0.1)
+            out = np.full((h, w, 3), p["pad"], np.uint8)
+            out[top:top + nh, left:left + nw] = img
+            geo = dict(sx=nw / iw, sy=nh / ih, dx=float(left), dy=float(top))
         elif p["letterbox"] is None:
             out = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
             geo = dict(sx=w / iw, sy=h / ih, dx=0.0, dy=0.0)
@@ -126,9 +150,11 @@ def model_input(u8, dtype, white):
 
 
 def cells(out, k):
-    """Raw output -> [C, 85] cells (a copy for 'grid')."""
+    """Raw output -> [C, 85] cells (a copy for 'grid'; [C, 84] per grid position for 'dense')."""
     if k == "rows":
         return out.reshape(-1, out.shape[-1])
+    if k == "dense":
+        return out.reshape(out.shape[1], -1).T.copy()
     a = out.shape[1] // 85
     return out.reshape(a, 85, out.shape[2], out.shape[3]).transpose(0, 2, 3, 1).reshape(-1, 85)
 
@@ -139,6 +165,10 @@ def uncells(index, values, shape, k):
         out = np.full((int(np.prod(shape[:-1])), shape[-1]), EMPTY[k], np.float32)
         out[index] = values
         return out.reshape(shape)
+    if k == "dense":
+        c = np.full((int(np.prod(shape[2:])), shape[1]), EMPTY[k], np.float32)
+        c[index] = values
+        return np.ascontiguousarray(c.T).reshape(shape)
     a, gh, gw = shape[1] // 85, shape[2], shape[3]
     c = np.full((a * gh * gw, 85), EMPTY[k], np.float32)
     c[index] = values
@@ -154,6 +184,8 @@ def candidates(c, k, conf):
     """Indices of the cells whose objectness * best class score >= conf."""
     if k == "rows":
         return np.nonzero(c[:, 4] * c[:, 5:].max(1) >= conf)[0]
+    if k == "dense":  # no objectness: sigmoid(best class logit) >= conf
+        return np.nonzero(c[:, 4:].max(1) >= np.log(conf / (1.0 - conf)))[0]
     obj = sigmoid(c[:, 4].astype(np.float32))
     idx = np.nonzero(obj >= conf)[0]  # class scores are <= 1: cheap pre-filter on the objectness alone
     score = obj[idx] * sigmoid(c[idx, 5:].max(1).astype(np.float32))

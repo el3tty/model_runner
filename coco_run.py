@@ -69,7 +69,7 @@ def main():
     print(f"{args.kmodel}: input {shape} {dtype}, {kpu.outputs_size} output(s), {model}, conf {conf}, "
           f"{len(images)} images")
 
-    n_out = kpu.outputs_size
+    n_out = kpu.outputs_size // 2 if k == "dense" else kpu.outputs_size  # yolo26: box + class map per stride
     ids, shapes = [], [None] * n_out
     rows, index, values = ([[] for _ in range(n_out)] for _ in range(3))
     t0 = time.time()
@@ -83,7 +83,7 @@ def main():
         t = time.time()
         kpu.set_input_tensor(0, nn.RuntimeTensor.from_numpy(x))
         kpu.run()
-        outs = [kpu.get_output_tensor(o).to_numpy() for o in range(n_out)]
+        outs = cu.group([kpu.get_output_tensor(o).to_numpy() for o in range(kpu.outputs_size)], model)
         t_run += time.time() - t
         ids.append(e["id"])
         for o, out in enumerate(outs):
