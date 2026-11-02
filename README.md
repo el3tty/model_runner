@@ -36,12 +36,12 @@ Placeholders used below:
 
 ## Models
 
-| `--detect` | Input | ONNX | kmodel |
-|---|---|---|---|
-| `yolox` | 416×416, BGR 0..255, letterbox top-left, pad 114 | YOLOX-nano QAT, `onnx/yolox-qat-qdq-wfuse.onnx` | `kmodel/yolox-qat-qdq.kmodel` |
-| `yolov3` | 416×416, RGB 0..1, letterbox centered, pad 128 | ONNX model zoo YOLOv3 int8, `onnx/yolov3-12-int8-heads.onnx` | `kmodel/yolov3-12-int8.kmodel` |
-| `yolo-fastest` | 320×320, RGB 0..1, plain resize | Yolo-Fastest 1.1 int8, `onnx/yolo-fastest-1.1-320_int8_qop.onnx` | `kmodel/yolo-fastest-1.1-320-qop.kmodel` |
-| `yolo26` | 640×640, RGB 0..255, letterbox centered, pad 114 | Ultralytics YOLO26n, `onnx/yolo26n-640-nosplit.onnx` | `kmodel/yolo26n-640-nosplit-u8-ptq.kmodel` |
+| `--detect` | Model | Input |
+|---|---|---|
+| `yolox` | [YOLOX-nano](#yolox-nano-qat) | 416×416, BGR 0..255, letterbox top-left, pad 114 |
+| `yolov3` | [YOLOv3](#yolov3-and-yolo-fastest) | 416×416, RGB 0..1, letterbox centered, pad 128 |
+| `yolo-fastest` | [Yolo-Fastest 1.1](#yolov3-and-yolo-fastest) | 320×320, RGB 0..1, plain resize |
+| `yolo26` | [YOLO26n](#yolo26n) | 640×640, RGB 0..255, letterbox centered, pad 114 |
 
 All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yolo_post.py` decodes them.
 
