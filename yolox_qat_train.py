@@ -5,12 +5,12 @@ Start from the calibrated model written by yolox_qat.py (qat_out/qat_init.pth).
 
 Short pilot (check that the pipeline works and the AP goes up):
 
-    python yolox_qat_train.py --init qat_out/qat_init.pth -b 64 --epochs 2 --iters-per-epoch 500 ^
+    python yolox_qat_train.py --init qat_out/qat_init.pth -b 16 --epochs 2 --iters-per-epoch 500 ^
         --no-aug-epochs 1 --eval-first --out qat_pilot
 
 Real run (one epoch = the whole train2017, 15 epochs, mosaic/mixup off for the last 3):
 
-    python yolox_qat_train.py --init qat_out/qat_init.pth -b 64 --epochs 15 --no-aug-epochs 3 --out qat_run
+    python yolox_qat_train.py --init qat_out/qat_init.pth -b 16 --epochs 15 --no-aug-epochs 3 --out qat_run
 
 What it does (the YOLOX training recipe, adapted for fine-tuning):
   * the model is the BN-folded network with fake quantizers (weights: per-channel, recomputed from the weights at
@@ -72,7 +72,7 @@ def main():
     ap.add_argument("-n", "--name", default="yolox-nano", help="YOLOX experiment name")
     ap.add_argument("--init", default="qat_out/qat_init.pth", help="calibrated fake-quant model from yolox_qat.py")
     ap.add_argument("--resume", default=None, help="latest.pth of an interrupted run")
-    ap.add_argument("-b", "--batch-size", type=int, default=64)
+    ap.add_argument("-b", "--batch-size", type=int, default=16)
     ap.add_argument("--eval-batch-size", type=int, default=64)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=15)
