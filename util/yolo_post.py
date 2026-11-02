@@ -12,7 +12,8 @@ drawing, for the detector heads selected with --detect:
   yolo26        the raw one-to-many head of Ultralytics YOLO26 (yolo_to_onnx.py): per stride 8, 16, 32 a box map
                 [1, 4, H/s, W/s] = (l, t, r, b) distances from the cell center in strides (no DFL) and a class map
                 [1, 80, H/s, W/s] of logits (no objectness; decoded with objectness 1). Input RGB, 0..255 (letterbox
-                centered, pad 114).
+                centered, pad 114). Also the other Ultralytics detectors exported by yolo_to_onnx.py (YOLO12,
+                YOLO11, YOLOv8): their box maps are DFL logits [1, 64, H/s, W/s], reduced to the 4 distances first.
 
 The anchor heads hold 3 anchors x (tx, ty, tw, th, objectness, 80 class logits) per cell and are decoded as in darknet:
 cx = (sigmoid(tx) + col) * stride, w = exp(tw) * anchor_w (likewise y, h), sigmoid on objectness and classes. Every
@@ -62,19 +63,32 @@ def decode_yolox(outs, h, w, _anchors):
     return out
 
 
+DFL_BINS = 16
+
+
+def dfl(box):
+    """DFL box logits [1, 4 * 16, h, w] -> distances [1, 4, h, w]: per side the softmax-weighted mean of 0..15."""
+    t = box.astype(np.float32).reshape(box.shape[0], 4, DFL_BINS, *box.shape[2:])
+    p = np.exp(t - t.max(2, keepdims=True))
+    return (p * np.arange(DFL_BINS, dtype=np.float32).reshape(1, 1, -1, 1, 1)).sum(2) / p.sum(2)
+
+
 def join_split(outs):
-    """YOLO26 box [1, 4, h, w] and class [1, 80, h, w] maps (any order) -> one [1, 84, h, w] per stride, finest grid
-    first. Already joined outputs are returned as they are."""
-    if all(o.shape[1] != 4 for o in outs):
+    """Ultralytics box [1, 4, h, w] (or DFL logits [1, 64, h, w]) and class [1, 80, h, w] maps (any order) -> one
+    [1, 84, h, w] per stride, finest grid first. Already joined outputs are returned as they are."""
+    if all(o.shape[1] not in (4, 4 * DFL_BINS) for o in outs):
         return list(outs)
     by_grid = {}
     for o in outs:
-        by_grid.setdefault(tuple(o.shape[2:]), {})["box" if o.shape[1] == 4 else "cls"] = o
+        if o.shape[1] == 4 * DFL_BINS:
+            by_grid.setdefault(tuple(o.shape[2:]), {})["box"] = dfl(o)
+        else:
+            by_grid.setdefault(tuple(o.shape[2:]), {})["box" if o.shape[1] == 4 else "cls"] = o
     joined = []
     for g in sorted(by_grid, key=lambda g: -g[0] * g[1]):
         pair = by_grid[g]
         if set(pair) != {"box", "cls"}:
-            raise ValueError(f"grid {g}: expected one box map (4 channels) and one class map, got {sorted(pair)}")
+            raise ValueError(f"grid {g}: expected one box map (4 or 64 channels) and one class map, got {sorted(pair)}")
         joined.append(np.concatenate((pair["box"], pair["cls"]), 1))
     return joined
 
