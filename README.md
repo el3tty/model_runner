@@ -51,7 +51,7 @@ All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yol
 
    ```
    python -c "from ultralytics import YOLO; YOLO('weights/yolo26n.pt')"
-   python yolo26_to_onnx.py weights/yolo26n.pt onnx/yolo26n-640-nosplit.onnx
+   python yolo_to_onnx.py weights/yolo26n.pt onnx/yolo26n-640-nosplit.onnx
    ```
 
    The graph ends at the one-to-many head (`end2end=False`): per stride 8/16/32 a box map `[1, 4, H/s, W/s]`

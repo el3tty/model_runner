@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Export an Ultralytics YOLO26 checkpoint (yolo26n.pt) to a float ONNX model with the raw one-to-many head outputs, for
-coco_eval.py --onnx and nncase.
+Export an Ultralytics detector checkpoint (YOLO26 yolo26n.pt, YOLO12 yolo12n.pt, ...) to a float ONNX model with the
+raw head outputs, for coco_eval.py --onnx and nncase (YOLOX has its own exporter, pth_to_onnx.py).
 
 The graph ends at the last conv of every head branch, before the box/class concat (end2end=False, no decoding, no
 top-k), so box and class logits keep their own quantization scales on the K230:
     box8  [1, 4, H/8, W/8]    cls8  [1, 80, H/8, W/8]     (likewise 16 and 32)
-box = (l, t, r, b) distances from the cell center in units of the stride (no DFL, reg_max 1); cls = class logits (no
-objectness). BatchNorm is folded and the 1/255 input scaling is folded into the first conv, so the input is RGB 0..255
-float32 1x3xHxW (letterbox centered, pad 114: coco_prepare.py --detect yolo26). The cv1(x).chunk(2) of every C3k2 /
-C2PSA block becomes two convs (no Slice/Split, which nncase would run on the CPU); --keep-split exports it as is.
+box = (l, t, r, b) distances from the cell center in units of the stride; cls = class logits (no objectness). That is
+YOLO26 (no DFL, reg_max 1); with a DFL head (reg_max 16: YOLOv8, YOLO11, YOLO12) box is [1, 4 * 16, H/s, W/s]: per
+side 16 logits, the distance is their softmax-weighted mean of 0..15 (left to the decoder). BatchNorm is folded and
+the 1/255 input scaling is folded into the first conv, so the input is RGB 0..255 float32 1x3xHxW (letterbox
+centered, pad 114: coco_prepare.py --detect yolo26). The cv1(x).chunk(2) of every C3k2 / C2PSA block becomes two
+convs (no Slice/Split, which nncase would run on the CPU); --keep-split exports it as is.
 
 Usage:
-    python yolo26_to_onnx.py weights/yolo26n.pt onnx/yolo26n-640.onnx [--size 640] [--opset 13] [--keep-split]
+    python yolo_to_onnx.py weights/yolo26n.pt onnx/yolo26n-640.onnx [--size 640] [--opset 13] [--keep-split]
+    python yolo_to_onnx.py weights/yolo12n.pt onnx/yolo12n-640.onnx
 """
 import argparse
 import copy
@@ -24,7 +27,7 @@ import torch.nn as nn
 
 
 class RawHead(nn.Module):
-    """The YOLO26 network up to the raw one-to-many head convs."""
+    """The network up to the raw (one-to-many) head convs."""
 
     def __init__(self, model):
         super().__init__()
@@ -85,7 +88,7 @@ def split_cv1(model):
 
 
 def build(weights, split=True):
-    """yolo26 checkpoint -> RawHead (eval, BatchNorm folded, input 0..255; split: see split_cv1)."""
+    """Ultralytics checkpoint -> RawHead (eval, BatchNorm folded, input 0..255; split: see split_cv1)."""
     from ultralytics import YOLO
 
     model = YOLO(weights).model.float().eval()
@@ -109,8 +112,6 @@ def main():
 
     net = build(args.weights, split=not args.keep_split)
     det = net.model.model[-1]
-    if det.reg_max != 1:
-        raise SystemExit(f"reg_max {det.reg_max}: this export expects a DFL-free head (YOLO26)")
     names = [f"{k}{int(s)}" for s in det.stride for k in ("box", "cls")]
     dummy = torch.zeros(1, 3, args.size, args.size)
     kwargs = dict(input_names=["images"], output_names=names, opset_version=args.opset, do_constant_folding=True)

@@ -9,7 +9,7 @@ drawing, for the detector heads selected with --detect:
                 gray 128 padding).
   yolo-fastest  the two raw heads of Yolo-Fastest 1.1 (darknet, yolo-fastest-1.1.cfg): [1, 255, H/s, W/s] for strides
                 16 and 32. Input RGB, 0..1 (plain resize).
-  yolo26        the raw one-to-many head of Ultralytics YOLO26 (yolo26_to_onnx.py): per stride 8, 16, 32 a box map
+  yolo26        the raw one-to-many head of Ultralytics YOLO26 (yolo_to_onnx.py): per stride 8, 16, 32 a box map
                 [1, 4, H/s, W/s] = (l, t, r, b) distances from the cell center in strides (no DFL) and a class map
                 [1, 80, H/s, W/s] of logits (no objectness; decoded with objectness 1). Input RGB, 0..255 (letterbox
                 centered, pad 114).
