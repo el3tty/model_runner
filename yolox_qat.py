@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Calibrate the fake-quant YOLOX (nano) model: the starting point of QAT (yolox_qat_train.py) and a PTQ baseline.
 
-Needs util\qat_generic.py (model independent fake-quant code) and util\qat_yolox.py (YOLOX specific code) next to
+Needs util/qat_generic.py (model independent fake-quant code) and util/qat_yolox.py (YOLOX specific code) next to
 this script, and the yolox package installed:
 
     python yolox_qat.py -c yolox_nano.pth

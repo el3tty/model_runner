@@ -5,7 +5,7 @@
     python pth_to_onnx.py qat-run/best.pth yolox-qat-best.float.onnx --float
     python pth_to_onnx.py qat-run/best.pth yolox-qat-new.onnx --new-exporter --opset 18 --example yolox-f32-bgr.in
 
-Needs util\qat_generic.py and util\qat_yolox.py (the shared QAT code) next to this script, and torch + the yolox
+Needs util/qat_generic.py and util/qat_yolox.py (the shared QAT code) next to this script, and torch + the yolox
 package. Runs
 on the CPU.
 
@@ -21,7 +21,7 @@ only with --act-qdq.
 
 Unless --float is given, an nncase quant scheme is written next to the model: output + ".qs.json" (e.g.
 yolox-qat.onnx.qs.json), in the format of nncase's QuantScheme.json, read back from the Q/DQ nodes of the exported
-model (see util\quant_scheme.py; no ranges are calibrated). Without --act-qdq the scheme is read from a temporary
+model (see util/quant_scheme.py; no ranges are calibrated). Without --act-qdq the scheme is read from a temporary
 export that has the activation Q/DQ pairs, so it still holds the learned activation ranges. Use --no-scheme to skip
 it.
 """

@@ -94,7 +94,7 @@ Needs the `yolox` package and the COCO folder YOLOX expects:
 
 ```
 python yolox_qat.py -c yolox_nano.pth --out qat_out
-python yolox_qat_train.py --init qat_out/qat_init.pth -b 16 --epochs 15 --no-aug-epochs 3 --out qat_run
+python yolox_qat_train.py --init qat_out/qat_init.pth -b 64 --epochs 15 --no-aug-epochs 3 --out qat_run
 python pth_to_onnx.py qat_run/best.pth onnx/yolox-qat-qdq-wfuse.onnx --act-qdq
 ```
 
