@@ -28,7 +28,6 @@ it.
 import argparse
 import os
 import tempfile
-from dataclasses import asdict
 
 import numpy as np
 
@@ -61,12 +60,11 @@ def main():
     ap.add_argument("--float", action="store_true", help="export without Q/DQ nodes (float graph, QAT weights)")
     args = ap.parse_args()
 
-    exp, qat, cfg, ckpt = load_qat_checkpoint(args.ckpt, args.name, args.exp_file)
-    print("config:", asdict(cfg))
+    exp, qat, ckpt = load_qat_checkpoint(args.ckpt, args.name, args.exp_file)
     print(f"checkpoint: epoch {ckpt.get('epoch', -1) + 1}, AP(0.50:0.95) {ckpt.get('ap50_95', float('nan')):.4f}, "
           f"AP50 {ckpt.get('ap50', float('nan')):.4f}")
     # the quantizer on/off flags are not part of the state_dict
-    set_state(qat, weights=not args.float, acts=args.act_qdq and not args.float, observe=False)
+    set_state(qat, weights=not args.float, acts=args.act_qdq and not args.float)
     print(describe(qat))
 
     example = None
@@ -79,7 +77,7 @@ def main():
             write_scheme(args.output, args.output + ".qs.json")
         else:
             # the activation ranges are only in the graph as Q/DQ pairs: read them from a temporary export that has them
-            set_state(qat, weights=True, acts=True, observe=False)
+            set_state(qat, weights=True, acts=True)
             with tempfile.TemporaryDirectory() as tmp:
                 tmp_onnx = os.path.join(tmp, "act-qdq.onnx")
                 export_onnx(exp, qat, tmp_onnx, args.opset, args.new_exporter, example, quiet=True,

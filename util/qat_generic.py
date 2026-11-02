@@ -2,43 +2,28 @@
 """Model independent quantization-aware-training building blocks (fake quantization, nncase rules).
 
 Nothing here knows about a particular network: it works on any torch model made of nn.Conv2d layers.
-  * QuantConfig, act_qparams, weight_qparams: the range / scale / zero-point rules copied from nncase
-    (QuantUtility.GetQuantParam, FixupRange, GetWeightsRangesByChannel); uint8 (nncase UnsignedMode) only.
-  * RangeObserver, ActFakeQuant, WeightFakeQuant, QConv2d: the fake-quant modules (activation ranges can be shared
-    between several quantizers, see tie_ranges).
-  * set_state, set_observer_momentum, describe, dump_ranges, calibrate, check_fold, bake_weights, export_onnx.
+  * act_qparams, weight_qparams: the range / scale / zero-point rules copied from nncase (QuantUtility.GetQuantParam,
+    FixupRange, GetWeightsRangesByChannel); uint8 (nncase UnsignedMode) only.
+  * ActRange, ActFakeQuant, WeightFakeQuant, QConv2d: the fake-quant modules (activation ranges can be shared between
+    several quantizers, see tie_ranges).
+  * calibrate: the activation ranges, chosen like nncase's PTQ (KLD or plain min/max); they stay fixed in training.
+  * set_state, describe, dump_ranges, check_legacy_cfg, bake_weights, export_onnx.
 A model specific module (see qat_yolox.py) decides where to put the quantizers.
 """
 import inspect
 import json
 import os
 import warnings
-from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 # ----------------------------------------------------------------------------------------------------------------------
-# configuration and quantization parameters
+# quantization parameters
 # ----------------------------------------------------------------------------------------------------------------------
-@dataclass
-class QuantConfig:
-    quantize_head_outputs: bool = False  # also fake-quantize the outputs of cls/reg/obj prediction convs
-    tie_concats: bool = True  # concat inputs share one range (nncase UniteConcatRange; verify on your model)
-
-    @classmethod
-    def from_dict(cls, d):
-        """QuantConfig of a checkpoint's "cfg". Older checkpoints also have act_signed / w_signed (the removed int8
-        mode): accepted when False, refused when True."""
-        d = dict(d)
-        signed = [k for k in ("act_signed", "w_signed") if d.pop(k, False)]
-        if signed:
-            raise ValueError(f"checkpoint uses int8 quantization ({', '.join(signed)}), which is no longer supported")
-        return cls(**d)
-
-
 QMIN, QMAX = 0, 255  # uint8 for activations and weights (the nncase default)
 
 
@@ -68,43 +53,25 @@ def weight_qparams(w):
 # ----------------------------------------------------------------------------------------------------------------------
 # modules
 # ----------------------------------------------------------------------------------------------------------------------
-class RangeObserver(nn.Module):
-    """Running min / max of a tensor. momentum None: cumulative mean of per-batch min/max, else EMA."""
+class ActRange(nn.Module):
+    """The [min_val, max_val] range of an activation, set by calibrate(); seen = number of calibration batches."""
 
     def __init__(self):
         super().__init__()
         self.register_buffer("min_val", torch.zeros(()))
         self.register_buffer("max_val", torch.zeros(()))
         self.register_buffer("seen", torch.zeros((), dtype=torch.long))
-        self.momentum = None
-
-    @torch.no_grad()
-    def update(self, x):
-        mn = x.detach().amin().float()
-        mx = x.detach().amax().float()
-        n = int(self.seen)
-        if n == 0:
-            self.min_val.copy_(mn)
-            self.max_val.copy_(mx)
-        else:
-            m = 1.0 / (n + 1) if self.momentum is None else self.momentum
-            self.min_val.add_((mn - self.min_val) * m)
-            self.max_val.add_((mx - self.max_val) * m)
-        self.seen += 1
 
 
 class ActFakeQuant(nn.Module):
-    """Per-tensor activation fake-quant. `params` can be shared with other ActFakeQuant (see tie())."""
+    """Per-tensor activation fake-quant. `params` can be shared with other ActFakeQuant (see tie_ranges())."""
 
     def __init__(self):
         super().__init__()
-        self.params = RangeObserver()
+        self.params = ActRange()
         self.enabled = False
-        self.observe = False
 
     def forward(self, x):
-        if self.observe:
-            self.params.update(x)
         if not self.enabled:
             return x
         scale, zp = act_qparams(self.params.min_val, self.params.max_val)
@@ -134,7 +101,7 @@ class WeightFakeQuant(nn.Module):
 class QConv2d(nn.Module):
     """Conv2d with fake-quantized weights (and optionally a fake-quantized output)."""
 
-    def __init__(self, conv, cfg, out_q=False):
+    def __init__(self, conv, out_q=False):
         super().__init__()
         self.conv = conv
         self.wq = WeightFakeQuant()
@@ -147,7 +114,7 @@ class QConv2d(nn.Module):
 
 
 # ----------------------------------------------------------------------------------------------------------------------
-# sharing, state, calibration, export
+# sharing, state
 # ----------------------------------------------------------------------------------------------------------------------
 def tie_ranges(quantizers, a, b):
     """Make the quantizers a and b (and everything already sharing with b) use one range."""
@@ -159,19 +126,20 @@ def tie_ranges(quantizers, a, b):
             q.params = pa
 
 
-def set_state(model, weights, acts, observe):
+def set_state(model, weights, acts):
     for m in model.modules():
         if isinstance(m, ActFakeQuant):
             m.enabled = acts
-            m.observe = observe
         elif isinstance(m, WeightFakeQuant):
             m.enabled = weights
 
 
-def set_observer_momentum(model, momentum):
-    for m in model.modules():
-        if isinstance(m, RangeObserver):
-            m.momentum = momentum
+def check_legacy_cfg(cfg):
+    """Older checkpoints store a "cfg" dict of options that are now fixed. Accept it only with the fixed values."""
+    fixed = {"quantize_head_outputs": False, "tie_concats": True, "act_signed": False, "w_signed": False}
+    bad = {k: v for k, v in (cfg or {}).items() if k not in fixed or fixed[k] != v}
+    if bad:
+        raise ValueError(f"checkpoint was made with options that are no longer supported: {bad}")
 
 
 def describe(model):
@@ -181,35 +149,161 @@ def describe(model):
     return f"{nconv} weight quantizers, {len(qs)} activation quantizers in {len(groups)} range groups"
 
 
-@torch.no_grad()
-def check_fold(fp32, folded, batch):
-    fp32.eval()
-    folded.eval()
-    a = fp32(batch)
-    b = folded(batch)
-    d = (a - b).abs()
-    n_bn = sum(isinstance(m, nn.BatchNorm2d) for m in folded.modules())
-    print(f"fold check: BatchNorm layers left = {n_bn}; output max |diff| = {d.max().item():.3e}, "
-          f"mean |diff| = {d.mean().item():.3e}, max |fp32 output| = {a.abs().max().item():.3e}")
+# ----------------------------------------------------------------------------------------------------------------------
+# calibration: nncase's PTQ range selection (Quantizer.cs, Quantizer.Algorithms.cs), ported as is
+# ----------------------------------------------------------------------------------------------------------------------
+SRC_BINS, DST_BINS = 8192, 256  # nncase Quantizer.RunAsync
+
+
+def _fix_up_range(lo, hi):
+    """Quantizer.FixUpRange (asymmetric): the range contains 0 and is at least 1e-6 wide (else 0.1)."""
+    lo, hi = min(lo, 0.0), max(hi, 0.0)
+    r = hi - lo
+    return lo, lo + (0.1 if r < 1e-6 else r)
+
+
+def _box_smooth(p, box=512):
+    """Quantizer.Smooth: moving sum of `box` bins / box, on the zero-padded histogram."""
+    pad = np.zeros(box - 1, np.float64)
+    c = np.concatenate(([0.0], np.cumsum(np.concatenate((pad, p, pad)))))
+    k = np.arange(len(p)) + box // 2
+    return ((c[k + box] - c[k]) / box).astype(np.float32)
+
+
+def _smooth_distribution(p, eps=1e-4):
+    """Quantizer.SmoothDistribution, in place like nncase: eps on the empty bins, taken from the others."""
+    zeros = p == 0
+    n_zeros = int(zeros.sum())
+    n_nonzeros = len(p) - n_zeros
+    if n_nonzeros == 0 or eps * n_zeros / n_nonzeros >= 1.0:
+        return None
+    p += np.where(zeros, np.float32(eps), np.float32(-eps * n_zeros / n_nonzeros))
+    return p
+
+
+def _compute_kld(p, q):
+    """Quantizer.ComputeKld; normalizes p and q in place like nncase."""
+    if p is None or q is None:
+        return float("inf")
+    p /= p.sum()
+    q /= q.sum()
+    nz = p != 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        terms = np.where(q[nz] == 0, np.float32(1.0), p[nz] * np.log(p[nz] / q[nz]))
+    return float(terms.sum())
+
+
+def _kld_of_thresholds(lower, upper, src):
+    """Quantizer.GetKldOptRanges for one (lower, upper) bin threshold pair. src is changed in place (smoothed and
+    normalized), as in nncase, so the order of the calls matters."""
+    n = len(src)
+    src_range = upper - lower
+    per = src_range // DST_BINS
+    ref = src[lower:upper].copy()
+    ref[0] += src[:lower].sum()
+    ref[-1] += src[upper:].sum()
+    q = ref.reshape(DST_BINS, per).sum(1)
+    nonzero = ref != 0
+    count = nonzero.reshape(DST_BINS, per).sum(1)
+    ups = np.repeat(np.where(count > 0, q / np.maximum(count, 1), 0).astype(np.float32), per) * nonzero
+    ups2 = np.zeros(n, np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        left = lower + per  # left outliers: their mean on the non-empty bins
+        value = src[:left].sum() / np.count_nonzero(src[:left])
+        ups2[:left] += np.where(src[:left] != 0, value, 0)
+        ups2[left:upper - per] = ups[per:src_range - per]
+        right = upper - per  # right outliers; nncase does not reset the sum of the left ones
+        value = (value + src[right:].sum()) / np.count_nonzero(src[right:])
+        ups2[right:] += np.where(src[right:] != 0, value, 0)
+    return _compute_kld(_smooth_distribution(src), _smooth_distribution(ups2))
+
+
+def kld_range(hist, lo, hi):
+    """Quantizer.GetOptRanges (CalibMethod.Kld): the [min, max] with the lowest KL divergence between the histogram
+    (SRC_BINS bins over [lo, hi]) and its DST_BINS-level quantization; first the upper threshold, then the lower."""
+    src = _box_smooth(np.asarray(hist, np.float64))
+    interval = (hi - lo) / SRC_BINS
+    zero = int(np.clip((0 - lo) / interval, 0, SRC_BINS - 1))
+    best, min_kld = (0, SRC_BINS), float("inf")
+    upper = SRC_BINS
+    while upper >= DST_BINS and upper >= zero:
+        kld = _kld_of_thresholds(0, upper, src)
+        if kld < min_kld:
+            best, min_kld = (0, upper), kld
+        upper -= DST_BINS
+    min_kld, upper = float("inf"), best[1]
+    lower = 0
+    while lower <= zero and lower <= upper - DST_BINS:
+        kld = _kld_of_thresholds(lower, upper, src)
+        if kld < min_kld:
+            best, min_kld = (lower, upper), kld
+        lower += DST_BINS
+    return (best[0] - 0.5) * interval + lo, (best[1] + 0.5) * interval + lo
 
 
 @torch.no_grad()
-def calibrate(model, loader):
-    set_observer_momentum(model, None)
-    set_state(model, weights=True, acts=False, observe=True)
-    model.eval()
+def calibrate(model, loader, method="kld"):
+    """Set the range of every activation quantizer group from the images of `loader`, like nncase's PTQ:
+    "noclip" = min / max over all images (CalibMethod.NoClip), "kld" = a second pass that collects SRC_BINS-bin
+    histograms inside those ranges and keeps the range with the lowest KL divergence (CalibMethod.Kld, the default of
+    nncase compile). Quantizers that share a range (tie_ranges) get one histogram of all their tensors. Weights are
+    fake-quantized, activations are not, while calibrating; afterwards both are enabled."""
+    if method not in ("kld", "noclip"):
+        raise ValueError(f"unknown calibration method {method!r}")
+    qs = [m for m in model.modules() if isinstance(m, ActFakeQuant)]
+    groups = {}  # id(ActRange) -> ActRange
+    for q in qs:
+        groups.setdefault(id(q.params), q.params)
+    stats = {}
     device = next(model.parameters()).device
-    n = 0
-    for batch in loader:
-        model(batch[0].float().to(device))
-        n += batch[0].shape[0]
-    set_state(model, weights=True, acts=True, observe=False)
-    print(f"calibrated on {n} images")
-    unseen = [name for name, m in model.named_modules() if isinstance(m, ActFakeQuant) and int(m.params.seen) == 0]
+
+    def run(fn):
+        hooks = [q.register_forward_hook(lambda m, inp, out: fn(id(m.params), inp[0].detach().float())) for q in qs]
+        try:
+            n = 0
+            for batch in loader:
+                model(batch[0].float().to(device))
+                n += 1
+            return n
+        finally:
+            for h in hooks:
+                h.remove()
+
+    def minmax(gid, x):
+        lo, hi = float(x.amin()), float(x.amax())
+        old = stats.get(gid)
+        stats[gid] = (lo, hi) if old is None else (min(old[0], lo), max(old[1], hi))
+
+    set_state(model, weights=True, acts=False)
+    model.eval()
+    batches = run(minmax)
+    ranges = {gid: _fix_up_range(*r) for gid, r in stats.items()}
+
+    if method == "kld":
+        hists = {gid: torch.zeros(SRC_BINS, dtype=torch.float64, device=device) for gid in ranges}
+
+        def histogram(gid, x):
+            lo, hi = ranges[gid]
+            idx = ((x.reshape(-1) - lo) / ((hi - lo) / SRC_BINS)).clamp_(0, SRC_BINS - 1).long()
+            hists[gid] += torch.bincount(idx, minlength=SRC_BINS).double()
+
+        run(histogram)
+        ranges = {gid: kld_range(hists[gid].cpu().numpy(), *r) for gid, r in ranges.items()}
+
+    for gid, (lo, hi) in ranges.items():
+        groups[gid].min_val.fill_(lo)
+        groups[gid].max_val.fill_(hi)
+        groups[gid].seen.fill_(batches)
+    set_state(model, weights=True, acts=True)
+    print(f"calibrated {len(ranges)} range groups on {len(loader.dataset)} images ({method})")
+    unseen = len(groups) - len(ranges)
     if unseen:
-        print("WARNING: quantizers that saw no data:", unseen)
+        print(f"WARNING: {unseen} range groups saw no data")
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# export
+# ----------------------------------------------------------------------------------------------------------------------
 def bake_weights(model):
     """Replace every conv weight by its fake-quantized (per-output-channel) value and switch the weight quantizer off,
     so a following ONNX export has plain Conv nodes whose weights already lie on the quantization grid, with no

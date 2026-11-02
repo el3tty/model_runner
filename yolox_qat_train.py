@@ -14,18 +14,16 @@ Real run (one epoch = the whole train2017, 15 epochs, mosaic/mixup off for the l
 
 What it does (the YOLOX training recipe, adapted for fine-tuning):
   * the model is the BN-folded network with fake quantizers (weights: per-channel, recomputed from the weights at
-    every step; activations: per-tensor, ranges tracked by a moving average of the per-batch min/max);
-  * SGD (momentum 0.9, nesterov), the same learning rate for every parameter, YOLOX's warmup + cosine schedule,
-    lr = --lr * batch_size / 64; conv weights get weight decay --wd, biases none;
+    every step; activations: per-tensor, with the ranges calibrated by yolox_qat.py, which stay fixed: only the
+    weights train, except the stem conv, which stays frozen);
+  * SGD (momentum 0.9, nesterov), the same learning rate for every parameter, YOLOX's warmup (0.3 epochs) + cosine
+    schedule down to 5%, lr = --lr * batch_size / 64; conv weights get weight decay --wd, biases none;
   * mosaic/mixup are switched off for the last --no-aug-epochs epochs and the L1 loss is added (as in YOLOX);
-  * the activation ranges stop moving for the last --freeze-obs-epochs epochs;
-  * after every epoch: evaluation on val2017 with fake quantization, latest.pth, best.pth (+ ranges.json).
+  * after every epoch: evaluation on val2017 with fake quantization, latest.pth, best.pth (+ ranges_best.json).
 """
 import argparse
-import json
 import os
 import time
-from dataclasses import asdict
 
 import torch
 
@@ -33,15 +31,12 @@ from yolox.data import DataPrefetcher
 from yolox.exp import get_exp
 from yolox.utils import LRScheduler
 
-from util.qat_generic import QuantConfig, describe, dump_ranges, set_observer_momentum, set_state
-from util.qat_yolox import evaluate, fold, make_quantizable
+from util.qat_generic import check_legacy_cfg, describe, dump_ranges, set_state
+from util.qat_yolox import build_qat_model, evaluate
 
-
-def build_model(exp, cfg):
-    model = exp.get_model()  # the weights come from the checkpoint below; only the structure matters here
-    model.eval()
-    qat = make_quantizable(fold(model), cfg)
-    return qat.cuda()
+WARMUP_EPOCHS = 0.3
+MIN_LR_RATIO = 0.05
+PRINT_INTERVAL = 50
 
 
 def make_optimizer(model, lr, wd):
@@ -58,18 +53,15 @@ def make_loader(exp, batch_size, no_aug):
     return loader, DataPrefetcher(loader)
 
 
-def run_eval(exp, qat, batch_size, label, observing):
-    set_state(qat, weights=True, acts=True, observe=False)  # evaluation must not move the ranges
+def run_eval(exp, qat, batch_size, label):
     with torch.no_grad():
         ap = evaluate(exp, qat, batch_size, label)
-    set_state(qat, weights=True, acts=True, observe=observing)
     qat.train()
     return ap
 
 
-def save(path, qat, cfg, epoch, ap, args, opt=None):
-    state = {"model": qat.state_dict(), "cfg": asdict(cfg), "epoch": epoch, "ap50_95": ap[0], "ap50": ap[1],
-             "args": vars(args)}
+def save(path, qat, epoch, ap, args, opt=None):
+    state = {"model": qat.state_dict(), "epoch": epoch, "ap50_95": ap[0], "ap50": ap[1], "args": vars(args)}
     if opt is not None:
         state["optimizer"] = opt.state_dict()
     torch.save(state, path)
@@ -77,8 +69,7 @@ def save(path, qat, cfg, epoch, ap, args, opt=None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-n", "--name", default="yolox-nano")
-    ap.add_argument("-f", "--exp-file", default=None)
+    ap.add_argument("-n", "--name", default="yolox-nano", help="YOLOX experiment name")
     ap.add_argument("--init", default="qat_out/qat_init.pth", help="calibrated fake-quant model from yolox_qat.py")
     ap.add_argument("--resume", default=None, help="latest.pth of an interrupted run")
     ap.add_argument("-b", "--batch-size", type=int, default=16)
@@ -88,13 +79,7 @@ def main():
     ap.add_argument("--iters-per-epoch", type=int, default=0, help="0 = the whole training set; smaller = pilot")
     ap.add_argument("--lr", type=float, default=1e-3, help="base lr at batch size 64 (scaled by batch_size/64)")
     ap.add_argument("--wd", type=float, default=0.0, help="weight decay of the conv weights (YOLOX: 5e-4)")
-    ap.add_argument("--warmup-epochs", type=float, default=0.3)
-    ap.add_argument("--min-lr-ratio", type=float, default=0.05)
     ap.add_argument("--no-aug-epochs", type=int, default=3, help="last epochs without mosaic/mixup, with L1 loss")
-    ap.add_argument("--obs-momentum", type=float, default=0.01, help="EMA factor of the activation range observers")
-    ap.add_argument("--freeze-obs-epochs", type=int, default=2, help="last epochs with frozen activation ranges")
-    ap.add_argument("--clip-grad", type=float, default=0.0, help="max gradient norm (0 = off)")
-    ap.add_argument("--print-interval", type=int, default=50)
     ap.add_argument("--eval-first", action="store_true", help="evaluate before training (must reproduce yolox_qat.py)")
     ap.add_argument("--out", default="qat_train")
     args = ap.parse_args()
@@ -103,15 +88,18 @@ def main():
         raise SystemExit("CUDA is required")
     os.makedirs(args.out, exist_ok=True)
 
-    exp = get_exp(args.exp_file, args.name)
+    exp = get_exp(None, args.name)
     exp.data_num_workers = args.workers
     ckpt = torch.load(args.resume or args.init, map_location="cpu", weights_only=False)
-    cfg = QuantConfig.from_dict(ckpt["cfg"])
-    print("config:", asdict(cfg))
-    qat = build_model(exp, cfg)
+    check_legacy_cfg(ckpt.get("cfg"))
+    qat = build_qat_model(exp).cuda()
     qat.load_state_dict(ckpt["model"])
+    # The stem conv sees raw 0..255 pixels: with BatchNorm folded its weights are tiny and their gradients ~255x larger
+    # than elsewhere, so one shared lr wrecks it within a few dozen steps. Its quantized weights are fine as they are.
+    for p in qat.backbone.backbone.stem.parameters():
+        p.requires_grad_(False)
     print(describe(qat))
-    n_params = sum(p.numel() for p in qat.parameters())
+    n_params = sum(p.numel() for p in qat.parameters() if p.requires_grad)
     print(f"{n_params / 1e6:.2f}M trainable parameters, input size {exp.input_size}")
 
     lr = args.lr * args.batch_size / 64.0
@@ -128,15 +116,13 @@ def main():
     loader, prefetcher = make_loader(exp, args.batch_size, no_aug)
     qat.head.use_l1 = no_aug
     iters = args.iters_per_epoch or len(loader)
-    sched = LRScheduler("yoloxwarmcos", lr, iters, args.epochs, warmup_epochs=args.warmup_epochs, warmup_lr_start=0,
-                        no_aug_epochs=args.no_aug_epochs, min_lr_ratio=args.min_lr_ratio)
+    sched = LRScheduler("yoloxwarmcos", lr, iters, args.epochs, warmup_epochs=WARMUP_EPOCHS, warmup_lr_start=0,
+                        no_aug_epochs=args.no_aug_epochs, min_lr_ratio=MIN_LR_RATIO)
     print(f"{iters} iterations per epoch, {args.epochs} epochs")
 
-    set_observer_momentum(qat, args.obs_momentum)
-    observing = True
-    set_state(qat, weights=True, acts=True, observe=True)
+    set_state(qat, weights=True, acts=True)
     if args.eval_first:
-        run_eval(exp, qat, args.eval_batch_size, "before training", observing)
+        run_eval(exp, qat, args.eval_batch_size, "before training")
     qat.train()
 
     t_start = time.time()
@@ -146,10 +132,6 @@ def main():
             loader.close_mosaic()
             qat.head.use_l1 = True
             no_aug = True
-        if observing and epoch >= args.epochs - args.freeze_obs_epochs:
-            print("---> activation ranges frozen")
-            observing = False
-            set_state(qat, weights=True, acts=True, observe=False)
         qat.train()
 
         t_epoch = time.time()
@@ -172,27 +154,23 @@ def main():
                 raise SystemExit(f"loss is {loss.item()} at epoch {epoch + 1} iter {it + 1}; lower --lr")
             opt.zero_grad()
             loss.backward()
-            if args.clip_grad > 0:
-                torch.nn.utils.clip_grad_norm_(qat.parameters(), args.clip_grad)
             opt.step()
 
             for k in ("total_loss", "iou_loss", "conf_loss", "cls_loss", "l1_loss"):
-                v = outputs[k]
-                running[k] = running.get(k, 0.0) + float(v)
-            if (it + 1) % args.print_interval == 0:
-                n = args.print_interval
+                running[k] = running.get(k, 0.0) + float(outputs[k])
+            if (it + 1) % PRINT_INTERVAL == 0:
                 done = time.time() - t_epoch
                 eta = done / (it + 1) * (iters - it - 1)
                 print(f"epoch {epoch + 1}/{args.epochs} iter {it + 1}/{iters} lr {cur_lr:.2e} "
-                      + " ".join(f"{k.replace('_loss', '')} {v / n:.2f}" for k, v in running.items())
+                      + " ".join(f"{k.replace('_loss', '')} {v / PRINT_INTERVAL:.2f}" for k, v in running.items())
                       + f" | {(it + 1) * args.batch_size / done:.1f} img/s, epoch ETA {eta / 60:.1f} min")
                 running = {}
 
-        ap = run_eval(exp, qat, args.eval_batch_size, f"epoch {epoch + 1}", observing)
-        save(os.path.join(args.out, "latest.pth"), qat, cfg, epoch, ap, args, opt)
+        ap = run_eval(exp, qat, args.eval_batch_size, f"epoch {epoch + 1}")
+        save(os.path.join(args.out, "latest.pth"), qat, epoch, ap, args, opt)
         if ap[0] > best[0]:
             best = ap
-            save(os.path.join(args.out, "best.pth"), qat, cfg, epoch, ap, args)
+            save(os.path.join(args.out, "best.pth"), qat, epoch, ap, args)
             dump_ranges(qat, os.path.join(args.out, "ranges_best.json"))
             print(f"---> new best AP {ap[0]:.4f}")
         print(f"epoch {epoch + 1} took {(time.time() - t_epoch) / 60:.1f} min, "

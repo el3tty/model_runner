@@ -98,7 +98,12 @@ python yolox_qat_train.py --init qat_out/qat_init.pth -b 16 --epochs 15 --no-aug
 python pth_to_onnx.py qat_run/best.pth onnx/yolox-qat-qdq-wfuse.onnx --act-qdq
 ```
 
-`--act-qdq` puts Q/DQ pairs with the learned ranges on the activations; the weight quantization is baked into the
+`yolox_qat.py` sets the activation ranges like nncase's PTQ (`--calib-method kld`, the default, or `noclip`) on 512
+train2017 images and prints the AP with weights-only and with weights + activations fake quantization. The ranges stay
+fixed during `yolox_qat_train.py`; only the weights train. The board result in the table below comes from an earlier
+version that calibrated with the mean of per-batch min / max and let the ranges follow the training data.
+
+`--act-qdq` puts Q/DQ pairs with the trained ranges on the activations; the weight quantization is baked into the
 conv weights. nncase reads the ranges from the Q/DQ nodes, so no calibration dataset is needed:
 
 ```
