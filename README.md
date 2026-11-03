@@ -58,7 +58,8 @@ All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yol
    (l, t, r, b in strides) and a class-logit map `[1, 80, H/s, W/s]`, kept apart so each gets its own quantization
    scale. BatchNorm and the 1/255 input scaling are folded, the `cv1(x).chunk(2)` of every C3k2 / C2PSA block is
    exported as two convs and the qkv conv + split of both attention blocks as three (q, k, v), because nncase runs
-   Slice / Split on the CPU. `--keep-split` gives the original graph (same AP, about 25 ms slower on the K230).
+   Slice / Split on the CPU. `--keep-split` gives the original graph (same AP, about 20 ms slower on the K230 with
+   the same input type; see the results).
 
 2. Calibration set: 300 random train2017 images (seed 0):
 
