@@ -301,3 +301,16 @@ COCO val2017, 5000 images, measured with the steps above:
 
 Time per image is `coco_run.py`'s `run`: set the input, run, read all outputs. The YOLOv3 AP is likely inflated: the
 ONNX model zoo model may have been trained on images that are in val2017.
+
+## Runtime and simulator dumps
+
+The K230 simulator gives the board's results bit for bit, so a kmodel can be debugged on the PC. nncase's Debug
+runtime dumps the tensors of every CPU op, including the inputs and outputs of each KPU call, and with
+`NNCASE_SIM_CHECKPOINTS=1` the simulator also dumps what the KPU's activation units compute inside a call (one record
+per tile: the convolution's integer sums, the dequantisation / activation parameters and the outputs). How to make
+the dumps and how to read them: "Debug dumps and check points" in `<nncase>/src/Native/src/simulator/README.md`;
+`<nncase>/tools/ckpt_dump.py` prints them in readable form:
+
+```
+python <nncase>/tools/ckpt_dump.py 'dumps/Runtime/1$1_7.ckpt/act_dm_write.chk' --kind P --record 0
+```
