@@ -17,7 +17,7 @@ What it does (the YOLOX training recipe, adapted for fine-tuning):
     every step; activations: per-tensor, with the ranges calibrated by yolox_qat.py, which stay fixed: only the
     weights train, except the stem conv, which stays frozen);
   * SGD (momentum 0.9, nesterov), the same learning rate for every parameter, YOLOX's warmup (0.3 epochs) + cosine
-    schedule down to 5%, lr = --lr * batch_size / 64; conv weights get weight decay --wd, biases none;
+    schedule down to 5%, lr = --lr * batch_size / 64, no weight decay;
   * mosaic/mixup are switched off for the last --no-aug-epochs epochs and the L1 loss is added (as in YOLOX);
   * after every epoch: evaluation on val2017 with fake quantization, latest.pth, best.pth (+ ranges_best.json).
 """
@@ -39,13 +39,10 @@ MIN_LR_RATIO = 0.05
 PRINT_INTERVAL = 50
 
 
-def make_optimizer(model, lr, wd):
-    weights = [p for p in model.parameters() if p.requires_grad and p.ndim > 1]
-    biases = [p for p in model.parameters() if p.requires_grad and p.ndim <= 1]
-    opt = torch.optim.SGD([{"params": weights, "weight_decay": wd}, {"params": biases, "weight_decay": 0.0}],
-                          lr=lr, momentum=0.9, nesterov=True)
-    print(f"optimizer: {len(weights)} weight tensors (wd={wd}), {len(biases)} bias tensors, base lr={lr:.2e}")
-    return opt
+def make_optimizer(model, lr):
+    params = [p for p in model.parameters() if p.requires_grad]
+    print(f"optimizer: {len(params)} parameter tensors, base lr={lr:.2e}")
+    return torch.optim.SGD(params, lr=lr, momentum=0.9, nesterov=True)
 
 
 def make_loader(exp, batch_size, no_aug):
@@ -78,7 +75,6 @@ def main():
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--iters-per-epoch", type=int, default=0, help="0 = the whole training set; smaller = pilot")
     ap.add_argument("--lr", type=float, default=1e-3, help="base lr at batch size 64 (scaled by batch_size/64)")
-    ap.add_argument("--wd", type=float, default=0.0, help="weight decay of the conv weights (YOLOX: 5e-4)")
     ap.add_argument("--no-aug-epochs", type=int, default=3, help="last epochs without mosaic/mixup, with L1 loss")
     ap.add_argument("--eval-first", action="store_true", help="evaluate before training (must reproduce yolox_qat.py)")
     ap.add_argument("--out", default="qat_train")
@@ -103,7 +99,7 @@ def main():
     print(f"{n_params / 1e6:.2f}M trainable parameters, input size {exp.input_size}")
 
     lr = args.lr * args.batch_size / 64.0
-    opt = make_optimizer(qat, lr, args.wd)
+    opt = make_optimizer(qat, lr)
     start_epoch = 0
     best = (-1.0, -1.0)
     if args.resume:
