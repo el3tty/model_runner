@@ -3,7 +3,7 @@ YOLO post-processing shared by run-model.py (K230 board / simulator) and run-onn
 drawing, for the detector heads selected with --detect:
 
   yolox         the raw YOLOX head output [1, N, 85] = (dx, dy, log w, log h per grid cell, strides 8/16/32,
-                objectness, 80 class scores), as exported without box decoding (pth_to_onnx.py). Input BGR, 0..255.
+                objectness, 80 class scores), as exported without box decoding (qat_export.py yolox). Input BGR, 0..255.
   yolov3        the three raw heads of yolov3-12-int8-heads.onnx (ONNX model zoo YOLOv3, keras-yolo3, with the
                 decode / NMS part cut off): [1, 255, H/s, W/s] for strides 8, 16, 32. Input RGB, 0..1 (letterbox,
                 gray 128 padding).

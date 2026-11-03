@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Model independent quantization-aware-training building blocks (fake quantization, nncase rules).
 
-Nothing here knows about a particular network: it works on any torch model made of nn.Conv2d layers.
+Nothing here knows about a particular network: it works on any torch model made of convs, linears and LSTMs.
   * act_qparams, weight_qparams: the range / scale / zero-point rules copied from nncase (QuantUtility.GetQuantParam,
     FixupRange, GetWeightsRangesByChannel); uint8 (nncase UnsignedMode) only.
-  * ActRange, ActFakeQuant, WeightFakeQuant, QConv2d: the fake-quant modules (activation ranges can be shared between
-    several quantizers, see tie_ranges).
+  * ActRange, ActFakeQuant, WeightFakeQuant, QConv2d, QLinear, QLSTM: the fake-quant modules (several ActFakeQuant
+    can share one ActRange).
   * calibrate: the activation ranges, chosen like nncase's PTQ (KLD or plain min/max); they stay fixed in training.
-  * set_state, describe, dump_ranges, check_legacy_cfg, bake_weights, export_onnx.
-A model specific module (see qat_yolox.py) decides where to put the quantizers.
+  * set_state, describe, dump_ranges, bake_weights, export_onnx.
+The graph rules of qat_graph.py decide where to put the quantizers; qat_train.py is the training driver.
 """
 import inspect
 import json
@@ -64,7 +64,7 @@ class ActRange(nn.Module):
 
 
 class ActFakeQuant(nn.Module):
-    """Per-tensor activation fake-quant. `params` can be shared with other ActFakeQuant (see tie_ranges())."""
+    """Per-tensor activation fake-quant. `params` can be shared with other ActFakeQuant (one range group)."""
 
     def __init__(self):
         super().__init__()
@@ -113,33 +113,71 @@ class QConv2d(nn.Module):
         return self.out_q(y) if self.out_q is not None else y
 
 
-# ----------------------------------------------------------------------------------------------------------------------
-# sharing, state
-# ----------------------------------------------------------------------------------------------------------------------
-def tie_ranges(quantizers, a, b):
-    """Make the quantizers a and b (and everything already sharing with b) use one range."""
-    pa, pb = a.params, b.params
-    if pa is pb:
-        return
-    for q in quantizers:
-        if q.params is pb:
-            q.params = pa
+class QLinear(nn.Module):
+    """Linear (ONNX Gemm) with fake-quantized weights, per output feature."""
+
+    def __init__(self, linear):
+        super().__init__()
+        self.linear = linear
+        self.wq = WeightFakeQuant()
+
+    def forward(self, x):
+        return F.linear(x, self.wq(self.linear.weight), self.linear.bias)
 
 
+class QLSTM(nn.Module):
+    """ONNX LSTM (gates i, o, f, c; no peepholes; default activations) with the K230 fake quantization: W and R
+    per output row (direction x gate x hidden unit), and the hidden state h quantized (out_q, one range for both
+    directions) every time step: that is the tensor stored as Y and fed back into R * h. The cell state c and the
+    gates stay float (fp16 on the KPU). The input x is quantized by its producer.
+
+    w [D, 4H, I], r [D, 4H, H], b [D, 8H] as in ONNX; forward(x [T, B, I]) -> (Y [T, D, B, H], Y_h, Y_c [D, B, H])."""
+
+    def __init__(self, w, r, b, hidden_size, direction="forward"):
+        super().__init__()
+        if direction not in ("forward", "reverse", "bidirectional"):
+            raise ValueError(direction)
+        self.hidden_size = hidden_size
+        self.direction = direction
+        self.w = nn.Parameter(w.clone())
+        self.r = nn.Parameter(r.clone())
+        self.b = nn.Parameter(b.clone())
+        self.wq = WeightFakeQuant()
+        self.rq = WeightFakeQuant()
+        self.out_q = ActFakeQuant()
+
+    def forward(self, x):
+        h_size = self.hidden_size
+        w = self.wq(self.w.reshape(-1, self.w.shape[-1])).reshape(self.w.shape)
+        r = self.rq(self.r.reshape(-1, self.r.shape[-1])).reshape(self.r.shape)
+        steps = x.shape[0]
+        ys, hs, cs = [], [], []
+        for d in range(w.shape[0]):
+            xw = x @ w[d].T + self.b[d, :4 * h_size] + self.b[d, 4 * h_size:]  # [T, B, 4H]
+            h = x.new_zeros(x.shape[1], h_size)
+            c = x.new_zeros(x.shape[1], h_size)
+            out = [None] * steps
+            reverse = self.direction == "reverse" or d == 1
+            for t in (reversed(range(steps)) if reverse else range(steps)):
+                i, o, f, g = (xw[t] + h @ r[d].T).split(h_size, -1)
+                c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+                h = self.out_q(torch.sigmoid(o) * torch.tanh(c))
+                out[t] = h
+            ys.append(torch.stack(out))
+            hs.append(h)
+            cs.append(c)
+        return torch.stack(ys, 1), torch.stack(hs), torch.stack(cs)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# state
+# ----------------------------------------------------------------------------------------------------------------------
 def set_state(model, weights, acts):
     for m in model.modules():
         if isinstance(m, ActFakeQuant):
             m.enabled = acts
         elif isinstance(m, WeightFakeQuant):
             m.enabled = weights
-
-
-def check_legacy_cfg(cfg):
-    """Older checkpoints store a "cfg" dict of options that are now fixed. Accept it only with the fixed values."""
-    fixed = {"quantize_head_outputs": False, "tie_concats": True, "act_signed": False, "w_signed": False}
-    bad = {k: v for k, v in (cfg or {}).items() if k not in fixed or fixed[k] != v}
-    if bad:
-        raise ValueError(f"checkpoint was made with options that are no longer supported: {bad}")
 
 
 def describe(model):
@@ -246,8 +284,10 @@ def calibrate(model, loader, method="kld"):
     """Set the range of every activation quantizer group from the images of `loader`, like nncase's PTQ:
     "noclip" = min / max over all images (CalibMethod.NoClip), "kld" = a second pass that collects SRC_BINS-bin
     histograms inside those ranges and keeps the range with the lowest KL divergence (CalibMethod.Kld, the default of
-    nncase compile). Quantizers that share a range (tie_ranges) get one histogram of all their tensors. Weights are
-    fake-quantized, activations are not, while calibrating; afterwards both are enabled."""
+    nncase compile). Quantizers that share a range get one histogram of all their tensors. Like nncase,
+    it runs the float network (no fake quantization; quantized weights shift the histograms, and the KLD choice moves
+    with them); afterwards weights and activations are fake-quantized. The loader must give the network the input
+    the K230 sees (for a model compiled with --pre-process, the dequantized uint8 input)."""
     if method not in ("kld", "noclip"):
         raise ValueError(f"unknown calibration method {method!r}")
     qs = [m for m in model.modules() if isinstance(m, ActFakeQuant)]
@@ -274,7 +314,7 @@ def calibrate(model, loader, method="kld"):
         old = stats.get(gid)
         stats[gid] = (lo, hi) if old is None else (min(old[0], lo), max(old[1], hi))
 
-    set_state(model, weights=True, acts=False)
+    set_state(model, weights=False, acts=False)
     model.eval()
     batches = run(minmax)
     ranges = {gid: _fix_up_range(*r) for gid, r in stats.items()}

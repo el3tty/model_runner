@@ -16,7 +16,7 @@ Placeholders used below:
 ## Requirements
 
 * PC: Python 3, numpy, opencv-python, Pillow, onnxruntime, onnx, pycocotools. For the exports: torch,
-  ultralytics (YOLO26), the `yolox` package (YOLOX QAT).
+  ultralytics (YOLO26), the `yolox` package (YOLOX QAT). For QAT: torch (CUDA), onnx2torch.
 * nncase compiler: build the CLI in Release (calibration runs the model in nncase's own evaluator, about 5 s per
   image and pass even in Release):
 
@@ -89,46 +89,69 @@ All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yol
 
    Without the five pre-process lines the kmodel takes float32 0..255 input (about 4 ms slower per image).
 
-### YOLOX-nano QAT
+### QAT: YOLOX-nano and the PP-OCR recognizer
+
+`qat_train.py <task>` fine-tunes a model for the K230's uint8 quantization; `yolox` and `ppocr` are the tasks. The
+fake-quant model is the network as the K230 runs it: `util/qat_graph.py` puts the quantizers where the compile path
+quantizes, by graph rules, on a `torch.fx` graph (YOLOX: the float model traced; PP-OCR: the ONNX file converted with
+`onnx2torch`):
+
+* quantized ops: Conv (weights per output channel), Gemm (weights per output feature), LSTM, AveragePool /
+  GlobalAveragePool, Add / Mul of two tensors (residual adds, squeeze-excitation scaling);
+* an activation that is the only consumer of a quantized op fuses into it (ReLU, Clip, Sigmoid, HardSigmoid, SiLU,
+  HardSwish, also when spelled out as several ops); the activation output is the stored tensor;
+* a stored tensor is fake-quantized (uint8, per tensor) when a quantized op reads it, directly or through ops that
+  keep the quantization grid (MaxPool, nearest Resize / Upsample, Concat, slicing, Reshape, Transpose, ...); the
+  inputs of a Concat share one range (nncase unites concat ranges); the model input is not quantized;
+* the LSTM (`QLSTM`): the KPU runs it with uint8 x, W, R (per row) and hidden state, and an fp16 cell state; the
+  fake-quant version quantizes the hidden state at every time step (the tensor stored as Y and fed back).
+
+For YOLOX these rules give exactly the placement of the former hand-written code (111 activation quantizers in 99
+range groups, each at the same tensor). Then:
+
+1. the activation ranges: calibrated like nncase's PTQ (`--calib kld`, nncase's default KL divergence of 8192-bin
+   histograms, or `noclip` = min / max), on the float network and the input as the K230 sees it; that gives nncase's
+   own ranges (PP-OCR: all 80 equal to nncase's QuantScheme.json). `--init <checkpoint>` takes them (and the weights)
+   from a checkpoint, `--scheme <QuantScheme.json>` (ppocr) from an nncase quant scheme. The calibrated model is
+   `<out>/init.pth` (+ `ranges.json`); `--epochs 0` stops after evaluating it (the PTQ accuracy);
+2. training: the ranges stay fixed, the weights train; warmup + cosine lr down to 5% of `--lr`; `--clip-grad`; after
+   every epoch the task's metric, `latest.pth` (with the optimizer, for `--resume`), `best.pth` and `ranges_best.json`
+   in `--out`. `--eval-first` evaluates before training, `--iters-per-epoch` shortens epochs for a pilot run.
+
+| task | data | training | metric | export |
+|---|---|---|---|---|
+| `yolox` | COCO, YOLOX's pipeline (mosaic / mixup, off for the last `--no-aug-epochs` epochs, with the L1 loss) | YOLOX's loss (labels), SGD, `--lr` per 64 images, stem conv frozen | AP on val2017 | ONNX with Q/DQ pairs |
+| `ppocr` | text lines rendered on the fly (`util/ocr_synth.py`) | distillation: KL of the float and the fake-quant model's per-time-step class distributions (no labels), Adam | words / CER on `data/ocr-synth` | float ONNX + nncase quant scheme |
+
+`qat_export.py <task> <checkpoint> <output.onnx>` exports a checkpoint for nncase (the last column).
+`python qat_train.py <task> -h` and `python qat_export.py <task> -h` list the options. The code: `util/qat_train.py`
+(training and export drivers, schedule, checkpoints), `util/qat_graph.py` (placement, ONNX import, quant scheme
+matching), `util/qat_generic.py` (fake-quant modules, nncase's range rules and calibration, ONNX export),
+`util/qat_yolox.py` and `util/qat_ppocr.py` (the tasks, with their exports), `util/ocr_synth.py` (text lines),
+`util/quant_scheme.py` (the `.qs.json` writer of the YOLOX export).
+
+#### YOLOX-nano
 
 Needs the `yolox` package, the COCO folder YOLOX expects and `yolox_nano.pth` (the pretrained float model from the
-YOLOX release page). Training needs a CUDA GPU; see [QAT training on RunPod](#qat-training-on-runpod) for a rented one.
+YOLOX release page):
 
 ```
-python yolox_qat.py -c yolox_nano.pth --out qat_out
-python yolox_qat_train.py --init qat_out/qat_init.pth -b 16 --epochs 15 --no-aug-epochs 3 --out qat_run
-python pth_to_onnx.py qat_run/best.pth onnx/yolox-qat-kld.onnx --act-qdq
+python qat_train.py yolox -c yolox_nano.pth --epochs 0 --out qat_yolox
+python qat_train.py yolox --init qat_yolox/init.pth --epochs 15 --eval-first --out qat_yolox
+python qat_export.py yolox qat_yolox/best.pth onnx/yolox-qat-kld.onnx --act-qdq
 ```
 
-The QAT model is the network as the K230 runs it: BatchNorm folded into the convs, uint8 fake quantization with
-nncase's rules on the weights (per output channel) and on the activations (per tensor: every conv output after SiLU,
-the residual adds, the concat inputs, which share one range because nncase unites concat ranges). The head's
-prediction convs keep float outputs.
+The first line calibrates on `--calib-images` (512) random train2017 images and reports the PTQ AP (0.182, AP50 0.305);
+`-c yolox_nano.pth --epochs 15` does both in one run. The stem conv stays frozen (it sees raw 0..255 pixels, and
+with BatchNorm folded its gradients are far too large for the shared lr).
 
-The scripts:
-
-* `yolox_qat.py`: builds the QAT model from the float checkpoint and sets the activation ranges like nncase's PTQ,
-  on `--calib-images` (512) random train2017 images: `--calib-method kld` (the default, nncase's KL divergence of
-  8192-bin histograms) or `noclip` (plain min / max). Then it evaluates on val2017 with weights-only and with
-  weights + activations fake quantization (`--evals`; 0.254 and 0.183 AP) and writes `qat_init.pth` (the calibrated
-  model) and `ranges.json` to `--out`. A few minutes on a GPU.
-* `yolox_qat_train.py`: fine-tunes the calibrated model with YOLOX's training recipe (SGD, warmup + cosine lr,
-  `--lr` per 64 images, mosaic augmentation; the last `--no-aug-epochs` epochs on plain images with the L1 loss
-  added). The activation ranges stay fixed, only the weights train; the stem conv stays frozen (it sees raw 0..255
-  pixels, and with BatchNorm folded its gradients are far too large for the shared lr). After every epoch it
-  evaluates on val2017 and writes `latest.pth` (with the optimizer state, for `--resume`), `best.pth` and
-  `ranges_best.json` to `--out`. `--eval-first` evaluates before training (should repeat the 0.183);
-  `--iters-per-epoch` shortens epochs for a pilot run.
-* `pth_to_onnx.py`: exports `qat_init.pth`, `best.pth` or `latest.pth` to ONNX: input `1x3x416x416` float32 BGR
-  0..255, output `[1, 3549, 85]` without box decoding. The fake-quantized weights are baked into the conv weights
-  (`--weight-qdq` keeps Q/DQ nodes on them instead); `--act-qdq` adds a Q/DQ pair with the trained range on every
-  quantized activation; `--float` exports the trained weights without any quantization. It also writes nncase's
-  quant scheme (`<output>.qs.json`) read back from the exported graph (`--no-scheme` skips it). Runs on the CPU.
-* `util/qat_generic.py` (fake-quant modules, nncase's range rules, calibration, ONNX export; nothing
-  YOLOX-specific), `util/qat_yolox.py` (where the quantizers go in a YOLOX network, the YOLOX data pipeline and
-  evaluator), `util/quant_scheme.py` (the `.qs.json` writer).
-
-nncase reads the ranges from the Q/DQ nodes, so the compile needs no calibration dataset:
+`qat_export.py yolox` exports `init.pth`, `best.pth` or `latest.pth` (checkpoints of the former `yolox_qat.py` /
+`yolox_qat_train.py` load too) to ONNX: input `1x3x416x416` float32 BGR 0..255, output `[1, 3549, 85]` without box
+decoding. The fake-quantized weights are baked into the conv weights (`--weight-qdq` keeps Q/DQ nodes on them
+instead); `--act-qdq` adds a Q/DQ pair with the trained range on every quantized activation; `--float` exports the
+trained weights without any quantization. It also writes nncase's quant scheme (`<output>.qs.json`) read back from
+the exported graph (`--no-scheme` skips it). Runs on the CPU. nncase reads the ranges from the Q/DQ nodes, so the
+compile needs no calibration dataset:
 
 ```
 compile
@@ -139,29 +162,79 @@ kmodel/yolox-qat-kld.kmodel
 k230
 ```
 
+#### PP-OCR recognizer
+
+`onnx/ppocr-en-rec-32x320.onnx` (MobileNetV3 with squeeze-excitation blocks, two bidirectional LSTMs, CTC; input
+`1x3x32x320`, output `[1, 80, 97]`). Needs the original PaddleOCR ONNX
+`weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx` (its metadata holds the character set), the calibration images
+`data/ocr-synth/calib` (nncase's `--dataset`) and the labeled test set `data/ocr-synth` (1000 lines):
+
+```
+python qat_train.py ppocr --epochs 0 --out qat_ppocr
+python qat_train.py ppocr --init qat_ppocr/init.pth -b 128 --epochs 20 --out qat_ppocr
+python qat_export.py ppocr qat_ppocr/best.pth onnx/ppocr-en-rec-qat.onnx --scheme QuantScheme.json
+```
+
+The calibrated model scores what the board does (PTQ: 0.853 words / CER 0.029, the board 0.855 / 0.029; float
+0.931 / 0.014). A 200-iteration pilot at `-b 64` reached 0.918 / 0.015, and the kmodel of a similar pilot 0.888 /
+0.023 on the K230 simulator (bit-exact with the board) against 0.855 / 0.029 for PTQ: the fake-quant numbers are
+about 0.02-0.03 words optimistic. The input is mapped like the K230's pre-process, `(x - 128) / 127.5` (nncase's
+integer zero point; PaddleOCR uses 127.5).
+
+Training speed: the LSTMs run step by step in Python, about 110 lines/s on a GTX 1060 at `-b 128` (`-b 256` does not
+fit in 6 GB); the default 20 x 1000 x 128 lines take about 6.5 hours there. Fonts for the training lines:
+`--fonts <dir>` (every `.ttf` / `.otf` in it), else the Windows fonts `data/ocr-synth` was made with, else the DejaVu
+/ Liberation fonts of a Linux system (`apt-get install fonts-dejavu-core fonts-liberation`).
+`python -m util.ocr_synth <dir>` writes a new test set.
+
+`qat_export.py ppocr` writes the float ONNX with the trained weights and `<output>.qs.json`. The scheme template
+(`--scheme`) is nncase's QuantScheme.json of a PTQ compile of the float model (`--export-quant-scheme
+--export-weight-range-by-channel --dump-dir <dir>`): it names every tensor nncase quantizes; the export replaces the
+activation ranges with the checkpoint's and the weight ranges with the trained weights' (per channel, as nncase
+computes them). A Q/DQ export as for YOLOX does not work here: an unrolled LSTM would not match nncase's LSTM.
+Compile it like the PTQ build, with the scheme instead of `--export-quant-scheme`:
+
+```
+--quant-scheme=onnx/ppocr-en-rec-qat.onnx.qs.json
+--model-quant-mode
+UsePTQ
+onnx/ppocr-en-rec-qat.onnx
+kmodel/ppocr-en-rec-qat.kmodel
+k230
+```
+
+(with the same `--dataset`, `--pre-process true --input-type Uint8 --input-range -1 1` lines as the PTQ build).
+
 #### QAT training on RunPod
 
-The training is CPU-bound (data augmentation): about 5 hours on an RTX 4090 pod with 10 vCPUs at `-b 16`. Use a
-PyTorch template with a network volume (`/workspace` survives pod restarts; everything else does not) and "SSH over
-exposed TCP": the `ssh.runpod.io` proxy gives only an interactive shell, so `scp` and `rsync` fail through it.
-Placeholders: `<pod-ip>` and `<port>` from the pod's Connect page, `<key>` the SSH key added to RunPod.
+YOLOX training is CPU-bound (data augmentation): about 5 hours on an RTX 4090 pod with 10 vCPUs at `-b 16`. PP-OCR
+renders its training lines on the pod (no data set to upload) and fits a local GPU as well. Use a PyTorch template
+with a network volume (`/workspace` survives pod restarts; everything else does not) and "SSH over exposed TCP": the
+`ssh.runpod.io` proxy gives only an interactive shell, so `scp` and `rsync` fail through it. Placeholders:
+`<pod-ip>` and `<port>` from the pod's Connect page, `<key>` the SSH key added to RunPod.
 
-On the PC, pack this repository (git bundle: no remote needed) and copy it with the float checkpoint:
+On the PC, pack this repository (git bundle: no remote needed) and copy it with what the task needs (YOLOX: the float
+checkpoint; PP-OCR: the two ONNX files and `data/ocr-synth`, about 40 MB):
 
 ```
 git bundle create model_runner.bundle master
 scp -i <key> -P <port> model_runner.bundle yolox_nano.pth root@<pod-ip>:/workspace/
+scp -i <key> -P <port> onnx/ppocr-en-rec-32x320.onnx weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx root@<pod-ip>:/workspace/
+scp -i <key> -P <port> -r data/ocr-synth root@<pod-ip>:/workspace/
 ssh -i <key> -p <port> root@<pod-ip>
 ```
 
-On the pod: system packages (OpenCV needs libGL), YOLOX (its `onnx-simplifier` pin does not build on recent Python
-and is not needed), this repository and COCO 2017 (about 20 GB):
+On the pod: system packages, this repository and its PP-OCR files; for YOLOX also the `yolox` package (its
+`onnx-simplifier` pin does not build on recent Python and is not needed; OpenCV needs libGL) and COCO 2017 (about
+20 GB):
 
 ```
-apt-get update && apt-get install -y libgl1 libglib2.0-0 tmux unzip rsync
+apt-get update && apt-get install -y libgl1 libglib2.0-0 tmux unzip rsync fonts-dejavu-core fonts-liberation
+pip install onnx onnxruntime onnx2torch pillow
+cd /workspace && git clone model_runner.bundle model_runner && cd model_runner
+mkdir -p onnx weights/ppocr data && mv ../ppocr-en-rec-32x320.onnx onnx/ && mv ../en_number_mobile_v2.0_rec_infer.onnx weights/ppocr/ && mv ../ocr-synth data/ && mv ../yolox_nano.pth .
 cd /workspace && git clone https://github.com/Megvii-BaseDetection/YOLOX && cd YOLOX
 sed -i '/onnx-simplifier/d' requirements.txt && pip install -r requirements.txt && pip install -v -e . --no-build-isolation
-cd /workspace && git clone model_runner.bundle model_runner && mv yolox_nano.pth model_runner/
 mkdir -p /workspace/datasets/COCO && cd /workspace/datasets/COCO
 for f in train2017 val2017; do wget -q http://images.cocodataset.org/zips/$f.zip && unzip -q $f.zip && rm $f.zip; done
 wget -q http://images.cocodataset.org/annotations/annotations_trainval2017.zip && unzip -q annotations_trainval2017.zip && rm annotations_trainval2017.zip
@@ -181,16 +254,16 @@ cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us /sys/fs/cgroup/cpu/cpu.cfs_period_us
 tmux new -s qat
 export YOLOX_DATADIR=/workspace/datasets
 cd /workspace/model_runner
-python yolox_qat.py -c yolox_nano.pth --out qat_out 2>&1 | tee calib.log
-python yolox_qat_train.py --init qat_out/qat_init.pth -b 16 --epochs 15 --no-aug-epochs 3 --workers 8 --eval-first --out qat_run 2>&1 | tee train.log
+python qat_train.py yolox -c yolox_nano.pth --epochs 15 --workers 8 --eval-first --out qat_yolox 2>&1 | tee train-yolox.log
+python qat_train.py ppocr -b 128 --epochs 20 --workers 8 --eval-first --out qat_ppocr 2>&1 | tee train-ppocr.log
 ```
 
-If the pod restarts, continue with `--resume qat_run/latest.pth` and the same other arguments. `nvidia-smi -l 1`
-shows the GPU load (expect well under 100%: the CPUs are the limit). Back on the PC, fetch the run and export it:
+If the pod restarts, continue with `--resume <out>/latest.pth` and the same other arguments. `nvidia-smi -l 1` shows
+the GPU load (YOLOX: expect well under 100%, the CPUs are the limit). Back on the PC, fetch the run and export it:
 
 ```
-scp -i <key> -P <port> -r root@<pod-ip>:/workspace/model_runner/qat_run root@<pod-ip>:/workspace/model_runner/train.log .
-python pth_to_onnx.py qat_run/best.pth onnx/yolox-qat-kld.onnx --act-qdq
+scp -i <key> -P <port> -r root@<pod-ip>:/workspace/model_runner/qat_yolox .
+python qat_export.py yolox qat_yolox/best.pth onnx/yolox-qat-kld.onnx --act-qdq
 ```
 
 ### YOLOv3 and Yolo-Fastest

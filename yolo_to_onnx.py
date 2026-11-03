@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Export an Ultralytics detector checkpoint (YOLO26 yolo26n.pt, YOLO12 yolo12n.pt, ...) to a float ONNX model with the
-raw head outputs, for coco_eval.py --onnx and nncase (YOLOX has its own exporter, pth_to_onnx.py).
+raw head outputs, for coco_eval.py --onnx and nncase (YOLOX has its own exporter, qat_export.py yolox).
 
 The graph ends at the last conv of every head branch, before the box/class concat (end2end=False, no decoding, no
 top-k), so box and class logits keep their own quantization scales on the K230:

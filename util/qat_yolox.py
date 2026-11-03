@@ -1,165 +1,122 @@
 #!/usr/bin/env python3
-"""YOLOX specific QAT code, shared by yolox_qat.py (calibration / PTQ baseline), yolox_qat_train.py and
-pth_to_onnx.py: where the fake quantizers go in a YOLOX network, how to rebuild the quantized model, load a
-checkpoint, calibrate / evaluate with the YOLOX data pipeline and export it.
+"""YOLOX for QAT (qat_train.py yolox, qat_export.py yolox): the fake-quant model, data, loss, COCO evaluation, export.
 
-The model independent parts (fake-quant modules, nncase range rules, calibration, ONNX export) live in
-qat_generic.py. Needs the yolox package (and torch).
-
-Every concat's inputs share one activation range (nncase unites concat ranges) and the head's prediction convs are
-not fake-quantized at their outputs.
+The network is the float YOLOX with BatchNorm folded; YoloxBody (backbone + head convs, raw per-level outputs) is
+traced with torch.fx and qat_graph.py puts the fake quantizers in it by the graph rules (the same 111 activation
+quantizers in 99 range groups as the former hand-written placement: every conv output after SiLU, the residual adds,
+the concat inputs sharing one range; the head's prediction convs keep float outputs). QatYolox wraps the traced body
+with YOLOX's own head code for the loss (training) and the box decoding (evaluation). Needs the yolox package.
 """
 import copy
 import os
 import random
 import shutil
+import tempfile
 
+import numpy as np
 import torch
+import torch.fx
 import torch.nn as nn
 
-from yolox.exp import get_exp
-from yolox.models.network_blocks import BaseConv, Bottleneck, CSPLayer, DWConv, SPPBottleneck
-from yolox.utils import fuse_model
-
-from util import qat_generic
-from util.qat_generic import ActFakeQuant, QConv2d, check_legacy_cfg, tie_ranges
+from util import qat_generic, qat_graph
+from util.qat_generic import describe, set_state
+from util.qat_train import Task
 
 
-# ----------------------------------------------------------------------------------------------------------------------
-# modules
-# ----------------------------------------------------------------------------------------------------------------------
-class QBaseConv(nn.Module):
-    """Folded BaseConv: fake-quant conv -> SiLU -> fake-quant of the result (the tensor the hardware stores)."""
+class YoloxBody(nn.Module):
+    """Backbone + head convs of a BatchNorm folded YOLOX model: per level the raw [reg (4), obj (1), cls] output, before
+    any sigmoid. Traceable by torch.fx (YOLOXHead.forward is not: its loss is data dependent)."""
 
-    def __init__(self, base):
+    def __init__(self, model):
         super().__init__()
-        assert not hasattr(base, "bn"), "fold BatchNorm first (fuse_model)"
-        self.conv = QConv2d(base.conv)
-        self.act = base.act
-        self.out_q = ActFakeQuant()
+        self.backbone = model.backbone
+        self.head = model.head
 
     def forward(self, x):
-        return self.out_q(self.act(self.conv(x)))
+        fpn = self.backbone(x)
+        h = self.head
+        outs = []
+        for k in range(len(h.stems)):
+            f = h.stems[k](fpn[k])
+            cls_feat = h.cls_convs[k](f)
+            reg_feat = h.reg_convs[k](f)
+            outs.append(torch.cat([h.reg_preds[k](reg_feat), h.obj_preds[k](reg_feat), h.cls_preds[k](cls_feat)], 1))
+        return outs
 
 
-class QBottleneck(nn.Module):
-    def __init__(self, b):
+class QatYolox(nn.Module):
+    """The traced, fake-quantized YoloxBody (`body`) with YOLOXHead.forward's code around it: model(x, targets) in
+    training mode returns YOLOX's loss dict, model(x) in eval mode the [B, N, 85] outputs, decoded unless
+    head.decode_in_inference is False (the ONNX export)."""
+
+    def __init__(self, body, head):
         super().__init__()
-        self.conv1 = b.conv1
-        self.conv2 = b.conv2
-        self.use_add = b.use_add
-        self.add_q = ActFakeQuant() if b.use_add else None
+        self.body = body
+        object.__setattr__(self, "head", head)  # its methods and settings only; its convs are in body
 
-    def forward(self, x):
-        y = self.conv2(self.conv1(x))
-        if self.use_add:
-            y = self.add_q(y + x)
-        return y
+    def forward(self, x, targets=None):
+        outs = self.body(x)
+        head = self.head
+        dtype = outs[0].type()
+        if self.training:
+            outputs, origin_preds, x_shifts, y_shifts, strides = [], [], [], [], []
+            for k, (output, stride) in enumerate(zip(outs, head.strides)):
+                if head.use_l1:
+                    b, _, hsize, wsize = output.shape
+                    reg = output[:, :4].view(b, 1, 4, hsize, wsize).permute(0, 1, 3, 4, 2).reshape(b, -1, 4)
+                    origin_preds.append(reg.clone())
+                output, grid = head.get_output_and_grid(output, k, stride, dtype)
+                x_shifts.append(grid[:, :, 0])
+                y_shifts.append(grid[:, :, 1])
+                strides.append(torch.zeros(1, grid.shape[1]).fill_(stride).type_as(outs[0]))
+                outputs.append(output)
+            loss, iou_loss, conf_loss, cls_loss, l1_loss, num_fg = head.get_losses(
+                x, x_shifts, y_shifts, strides, targets, torch.cat(outputs, 1), origin_preds, dtype=outs[0].dtype)
+            return {"total_loss": loss, "iou_loss": iou_loss, "l1_loss": l1_loss, "conf_loss": conf_loss,
+                    "cls_loss": cls_loss, "num_fg": num_fg}
+        outs = [torch.cat([o[:, :4], o[:, 4:5].sigmoid(), o[:, 5:].sigmoid()], 1) for o in outs]
+        head.hw = [o.shape[-2:] for o in outs]
+        outputs = torch.cat([o.flatten(start_dim=2) for o in outs], dim=2).permute(0, 2, 1)
+        return head.decode_outputs(outputs, dtype=dtype) if head.decode_in_inference else outputs
 
 
-# ----------------------------------------------------------------------------------------------------------------------
-# model surgery
-# ----------------------------------------------------------------------------------------------------------------------
 def fold(model):
-    """BatchNorm folding with YOLOX's own function. NOTE: it freezes the fused convs (requires_grad False)."""
-    with torch.no_grad():  # otherwise the fused weights/biases keep a graph to the BN parameters (non-leaf)
-        return fuse_model(copy.deepcopy(model))
+    """BatchNorm folding with YOLOX's own function, on a copy; every parameter a trainable leaf again (fuse_model
+    freezes the fused convs and leaves their weights attached to the BN graph)."""
+    from yolox.utils import fuse_model
 
-
-def _convert(module):
-    for name, child in list(module.named_children()):
-        if type(child) is BaseConv:
-            setattr(module, name, QBaseConv(child))
-        elif isinstance(child, Bottleneck):
-            _convert(child)
-            setattr(module, name, QBottleneck(child))
-        else:
-            _convert(child)
-
-
-def last_q(m):
-    """The ActFakeQuant that quantizes the tensor produced by module m."""
-    if isinstance(m, QBaseConv):
-        return m.out_q
-    if isinstance(m, DWConv):
-        return last_q(m.pconv)
-    if isinstance(m, QBottleneck):
-        return m.add_q if m.use_add else last_q(m.conv2)
-    if isinstance(m, CSPLayer):
-        return last_q(m.conv3)
-    if isinstance(m, SPPBottleneck):
-        return last_q(m.conv2)
-    if isinstance(m, nn.Sequential):
-        return last_q(m[-1])
-    raise TypeError(type(m))
-
-
-def make_quantizable(folded):
-    """Replace the folded model's blocks by fake-quant ones (in place) and return it."""
-    _convert(folded)
-    head = folded.head
-    for lst in (head.cls_preds, head.reg_preds, head.obj_preds):
-        for i, conv in enumerate(lst):
-            lst[i] = QConv2d(conv)
-
-    quantizers = [m for m in folded.modules() if isinstance(m, ActFakeQuant)]
-    # CSPLayer: cat(m(conv1(x)), conv2(x))
-    for csp in [m for m in folded.modules() if isinstance(m, CSPLayer)]:
-        tie_ranges(quantizers, last_q(csp.m), last_q(csp.conv2))
-    # YOLOPAFPN.forward
-    p = folded.backbone
-    dark = p.backbone
-    tie_ranges(quantizers, last_q(p.lateral_conv0), last_q(dark.dark4))  # cat([upsample(fpn_out0), x1])
-    tie_ranges(quantizers, last_q(p.reduce_conv1), last_q(dark.dark3))  # cat([upsample(fpn_out1), x2])
-    tie_ranges(quantizers, last_q(p.bu_conv2), last_q(p.reduce_conv1))  # cat([bu_conv2(...), fpn_out1])
-    tie_ranges(quantizers, last_q(p.bu_conv1), last_q(p.lateral_conv0))  # cat([bu_conv1(...), fpn_out0])
-    # SPPBottleneck: the max-pools keep the grid of their input, nothing to tie.
-
-    for m in folded.modules():  # make sure every parameter is a leaf (the optimizer needs that)
+    with torch.no_grad():
+        folded = fuse_model(copy.deepcopy(model))
+    for m in folded.modules():
         for name, prm in list(m._parameters.items()):
             if prm is not None and not prm.is_leaf:
                 m._parameters[name] = nn.Parameter(prm.detach().clone())
-    for prm in folded.parameters():  # fuse_model froze the fused convs
+    for prm in folded.parameters():
         prm.requires_grad_(True)
     return folded
 
 
-# ----------------------------------------------------------------------------------------------------------------------
-# model building, data, evaluation, export
-# ----------------------------------------------------------------------------------------------------------------------
-def build_qat_model(exp):
-    """Fresh YOLOX model of the experiment, BatchNorm folded and fake quantizers inserted (weights NOT loaded: they
-    come from a checkpoint). The quantizers start disabled."""
-    model = exp.get_model()
-    model.eval()
-    return make_quantizable(fold(model))
+def make_quantizable(folded):
+    """QatYolox of a folded YOLOX model, the quantizers disabled."""
+    body = qat_graph.make_quantizable(torch.fx.symbolic_trace(YoloxBody(folded)))
+    return QatYolox(body, folded.head)
 
 
-def load_qat_checkpoint(path, name="yolox-nano", exp_file=None):
-    """Rebuild the model of a checkpoint written by yolox_qat.py / yolox_qat_train.py and load it (CPU, eval mode).
-    Returns (exp, qat, ckpt). The quantizer on/off flags are not part of the state_dict: the quantizers are left
-    disabled, use qat_generic.set_state() to switch them on."""
-    exp = get_exp(exp_file, name)
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    check_legacy_cfg(ckpt.get("cfg"))
-    qat = build_qat_model(exp)
-    qat.load_state_dict(ckpt["model"])
-    qat.eval()
-    return exp, qat, ckpt
-
-
-def export_onnx(exp, model, path, opset=13, new_exporter=False, example=None, quiet=False,
-                bake_conv_weights=False):
-    """qat_generic.export_onnx for a YOLOX model. The head is exported without box decoding
-    (decode_in_inference=False); input 1x3xHxW float32, raw 0..255 BGR; output [1, N, 85]."""
-    head = model.head
-    old_decode = head.decode_in_inference
-    head.decode_in_inference = False
-    try:
-        qat_generic.export_onnx(model, (1, 3, *exp.test_size), path, opset, new_exporter, example, quiet,
-                                bake_conv_weights)
-    finally:
-        head.decode_in_inference = old_decode
+def legacy_state_dict(folded, old):
+    """The state_dict of a checkpoint of the former hand-written placement (QBaseConv / QBottleneck: <conv>.out_q,
+    <bottleneck>.add_q) in the layout of make_quantizable(folded). The weights keep their names (prefixed with
+    "body."), each range goes to the quantizer of the same tensor."""
+    gm = torch.fx.symbolic_trace(YoloxBody(folded))
+    points, _, _ = qat_graph.plan(gm)
+    new = {"body." + k: v for k, v in old.items() if ".out_q." not in k and ".add_q." not in k}
+    for i, n in enumerate(points):
+        if n.op == "call_module" and n.target.endswith(".act"):
+            src = n.target[:-len(".act")] + ".out_q"
+        else:
+            src = list(n.meta["nn_module_stack"])[-1] + ".add_q"
+        for field in ("min_val", "max_val", "seen"):
+            new[f"body.actq_{i}.params.{field}"] = old[f"{src}.params.{field}"]
+    return new
 
 
 def make_calib_loader(exp, n_images, batch_size, workers, seed=0):
@@ -187,9 +144,169 @@ def _use_standard_cocoeval_without_compiler():
         yolox.layers.COCOeval_opt = COCOeval
 
 
-def evaluate(exp, model, batch_size, label):
+def evaluate(exp, model, batch_size):
+    """(AP 0.50:0.95, AP50) on val2017."""
     _use_standard_cocoeval_without_compiler()
     evaluator = exp.get_evaluator(batch_size, False)
-    ap50_95, ap50, summary = evaluator.evaluate(model, False, False, None, None, exp.test_size)
-    print(f"[{label}] AP(0.50:0.95) = {ap50_95:.4f}   AP50 = {ap50:.4f}")
+    with torch.no_grad():
+        ap50_95, ap50, _ = evaluator.evaluate(model, False, False, None, None, exp.test_size)
     return ap50_95, ap50
+
+
+def export_onnx(exp, model, path, opset=13, new_exporter=False, example=None, quiet=False, bake_conv_weights=False):
+    """qat_generic.export_onnx without box decoding: input 1x3xHxW float32 raw 0..255 BGR, output [1, N, 85]."""
+    head = model.head
+    old_decode = head.decode_in_inference
+    head.decode_in_inference = False
+    try:
+        qat_generic.export_onnx(model, (1, 3, *exp.test_size), path, opset, new_exporter, example, quiet,
+                                bake_conv_weights)
+    finally:
+        head.decode_in_inference = old_decode
+
+
+class YoloxTask(Task):
+    """YOLOX on COCO with YOLOX's own training recipe and loss (labels)."""
+
+    name = "yolox"
+    description = ("YOLOX (default yolox-nano) on COCO: YOLOX's loss and data pipeline (mosaic / mixup, switched off "
+                   "for the last --no-aug-epochs epochs, with the L1 loss), SGD, AP on val2017; the stem conv frozen")
+    default_lr = 1e-3
+    default_batch_size = 16
+    default_epochs = 15
+    default_clip_grad = 0.0
+
+    def add_args(self, ap):
+        ap.add_argument("-n", "--name", default="yolox-nano", help="YOLOX experiment name")
+        ap.add_argument("-f", "--exp-file", default=None, help="YOLOX experiment file (instead of --name)")
+        ap.add_argument("-c", "--ckpt", default=None, help="float YOLOX checkpoint (e.g. yolox_nano.pth)")
+        ap.add_argument("--calib-images", type=int, default=512, help="random train2017 images to calibrate on")
+        ap.add_argument("--no-aug-epochs", type=int, default=3, help="last epochs without mosaic/mixup, with L1 loss")
+        ap.add_argument("--eval-batch-size", type=int, default=64)
+
+    def exp(self, args):
+        from yolox.exp import get_exp
+
+        if not hasattr(self, "_exp"):
+            self._exp = get_exp(args.exp_file, args.name)
+            self._exp.data_num_workers = getattr(args, "workers", 4)
+        return self._exp
+
+    def build(self, args, device, load_float_weights):
+        model = self.exp(args).get_model()
+        if load_float_weights:
+            if not args.ckpt:
+                raise SystemExit("yolox: -c / --ckpt (the float checkpoint) is needed without --init / --resume")
+            model.load_state_dict(torch.load(args.ckpt, map_location="cpu", weights_only=False)["model"])
+        model.eval()
+        self._folded = fold(model)
+        return make_quantizable(self._folded).to(device)
+
+    def load_state_dict(self, model, state_dict):
+        if not any(k.startswith("body.") for k in state_dict):
+            state_dict = legacy_state_dict(self._folded, state_dict)
+        model.load_state_dict(state_dict)
+
+    def calib_loader(self, args):
+        return make_calib_loader(self.exp(args), args.calib_images, 32, args.workers)
+
+    def frozen_parameters(self, model, args):
+        # The stem conv sees raw 0..255 pixels: with BatchNorm folded its weights are tiny and their gradients ~255x
+        # larger than elsewhere, so one shared lr wrecks it within a few dozen steps.
+        return list(model.body.backbone.backbone.stem.parameters())
+
+    def base_lr(self, args):
+        return args.lr * args.batch_size / 64.0
+
+    def optimizer(self, params, lr, args):
+        return torch.optim.SGD(params, lr=lr, momentum=0.9, nesterov=True)
+
+    def _loader(self, args, no_aug):
+        from yolox.data import DataPrefetcher
+
+        self._train_loader = self.exp(args).get_data_loader(batch_size=args.batch_size, is_distributed=False,
+                                                            no_aug=no_aug, cache_img=None)
+        self._prefetcher = DataPrefetcher(self._train_loader)
+        self._no_aug = no_aug
+
+    def iters_per_epoch(self, args):
+        if not hasattr(self, "_train_loader"):
+            self._loader(args, False)
+        return len(self._train_loader)
+
+    def schedule(self, args, iters_per_epoch):
+        return int(0.3 * iters_per_epoch), 2, args.no_aug_epochs * iters_per_epoch  # YOLOX's yoloxwarmcos
+
+    def batches(self, model, args, epoch, iters):
+        no_aug = epoch >= args.epochs - args.no_aug_epochs
+        if not hasattr(self, "_train_loader"):
+            self._loader(args, no_aug)
+        elif no_aug and not self._no_aug:
+            print("---> no mosaic/mixup from now on, L1 loss added")
+            self._train_loader.close_mosaic()
+            self._no_aug = True
+        model.head.use_l1 = no_aug
+        for _ in range(iters):
+            yield self._prefetcher.next()
+
+    def loss(self, model, batch, args):
+        exp = self.exp(args)
+        inps, targets = batch
+        targets = targets.float()
+        targets.requires_grad = False
+        inps, targets = exp.preprocess(inps.float(), targets, exp.input_size)
+        out = model(inps, targets)
+        return out["total_loss"], {k: float(out[k]) for k in ("total_loss", "iou_loss", "conf_loss", "cls_loss",
+                                                               "l1_loss")}
+
+    def evaluate(self, model, args):
+        ap50_95, ap50 = evaluate(self.exp(args), model, args.eval_batch_size)
+        return {"AP": ap50_95, "AP50": ap50}
+
+    def add_export_args(self, ap):
+        ap.description = (
+            "ONNX of the fake-quant model: input 1x3xHxW float32 (raw 0..255 BGR), output [1, N, 85] without box "
+            "decoding (raw dx, dy, log w, log h, sigmoid objectness, sigmoid class scores). By default the per-channel "
+            "weight quantization is baked into the Conv weights (fake-quantized float values), so every Conv is a "
+            "plain Conv node; --act-qdq puts QuantizeLinear/DequantizeLinear pairs with the trained ranges on the "
+            "activations. Unless --float or --no-scheme, nncase's quant scheme is written to <output>.qs.json, read "
+            "back from the Q/DQ nodes (util/quant_scheme.py). Runs on the CPU.")
+        ap.add_argument("-n", "--name", default="yolox-nano", help="YOLOX experiment name (older checkpoints)")
+        ap.add_argument("-f", "--exp-file", default=None, help="YOLOX experiment file (older checkpoints)")
+        ap.add_argument("--opset", type=int, default=13, help="ONNX opset (per-channel Q/DQ needs >= 13)")
+        ap.add_argument("--new-exporter", action="store_true",
+                        help="use the torch.export based exporter (PyTorch >= 2.5; untested with fake-quant, try "
+                             "--opset 18; check the result with run-onnx.py)")
+        ap.add_argument("--example", default=None, metavar="FILE",
+                        help="raw f32 1x3xHxW tensor file used as the example input of the export instead of zeros")
+        ap.add_argument("--weight-qdq", action="store_true",
+                        help="keep Constant -> QuantizeLinear -> DequantizeLinear in front of every Conv weight "
+                             "instead of baking the weight quantization into the weights")
+        ap.add_argument("--act-qdq", action="store_true",
+                        help="QuantizeLinear -> DequantizeLinear pairs (the trained ranges) on the activations")
+        ap.add_argument("--no-scheme", action="store_true", help="do not write the nncase quant scheme")
+        ap.add_argument("--float", action="store_true", help="export without any quantization (the trained weights)")
+
+    def export(self, model, ckpt, args):
+        from util.quant_scheme import write_scheme
+
+        exp = self.exp(args)
+        set_state(model, weights=not args.float, acts=args.act_qdq and not args.float)
+        print(describe(model))
+        example = None
+        if args.example:
+            example = np.fromfile(args.example, dtype="<f4").reshape(1, 3, *exp.test_size)
+        export_onnx(exp, model, args.output, args.opset, args.new_exporter, example, quiet=True,
+                    bake_conv_weights=not args.weight_qdq)
+        if args.float or args.no_scheme:
+            return
+        if args.act_qdq:
+            write_scheme(args.output, args.output + ".qs.json")
+            return
+        # the activation ranges are in the graph only as Q/DQ pairs: read them from a temporary export that has them
+        set_state(model, weights=True, acts=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_onnx = os.path.join(tmp, "act-qdq.onnx")
+            export_onnx(exp, model, tmp_onnx, args.opset, args.new_exporter, example, quiet=True,
+                        bake_conv_weights=not args.weight_qdq)
+            write_scheme(tmp_onnx, args.output + ".qs.json")
