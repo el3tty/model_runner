@@ -56,9 +56,9 @@ All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yol
 
    The graph ends at the one-to-many head (`end2end=False`): per stride 8/16/32 a box map `[1, 4, H/s, W/s]`
    (l, t, r, b in strides) and a class-logit map `[1, 80, H/s, W/s]`, kept apart so each gets its own quantization
-   scale. BatchNorm and the 1/255 input scaling are folded, and the `cv1(x).chunk(2)` of every C3k2 / C2PSA block is
-   exported as two convs, because nncase runs Slice on the CPU. `--keep-split` gives the original graph (same AP,
-   about 20 ms slower on the K230).
+   scale. BatchNorm and the 1/255 input scaling are folded, the `cv1(x).chunk(2)` of every C3k2 / C2PSA block is
+   exported as two convs and the qkv conv + split of both attention blocks as three (q, k, v), because nncase runs
+   Slice / Split on the CPU. `--keep-split` gives the original graph (same AP, about 22 ms slower on the K230).
 
 2. Calibration set: 300 random train2017 images (seed 0):
 
@@ -293,7 +293,7 @@ COCO val2017, 5000 images, measured with the steps above:
 |---|---|---|---|---|
 | YOLO26n 640, float ONNX | onnxruntime | 0.409 | 0.569 | |
 | YOLO26n 640, PTQ, original graph, float32 input | board | 0.401 | 0.560 | 77 ms |
-| YOLO26n 640, PTQ, no-split, uint8 input | board | 0.401 | 0.560 | 53.5 ms |
+| YOLO26n 640, PTQ, no-split, uint8 input | board | 0.400 | 0.559 | 51.1 ms |
 | YOLOX-nano 416, QAT | board | 0.243 | 0.396 | 25.2 ms |
 | YOLOv3 416, int8 | board | 0.373 | 0.669 | |
 | Yolo-Fastest 1.1 320, int8 | board | 0.075 | 0.183 | |

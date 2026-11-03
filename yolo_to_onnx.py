@@ -11,7 +11,8 @@ YOLO26 (no DFL, reg_max 1); with a DFL head (reg_max 16: YOLOv8, YOLO11, YOLO12)
 side 16 logits, the distance is their softmax-weighted mean of 0..15 (left to the decoder). BatchNorm is folded and
 the 1/255 input scaling is folded into the first conv, so the input is RGB 0..255 float32 1x3xHxW (letterbox
 centered, pad 114: coco_prepare.py --detect yolo26). The cv1(x).chunk(2) of every C3k2 / C2PSA block becomes two
-convs (no Slice/Split, which nncase would run on the CPU); --keep-split exports it as is.
+convs and the qkv conv + split of every attention block three (q, k, v): no Slice/Split, which nncase would run on
+the CPU. --keep-split exports both as they are.
 
 Usage:
     python yolo_to_onnx.py weights/yolo26n.pt onnx/yolo26n-640.onnx [--size 640] [--opset 13] [--keep-split]
@@ -49,17 +50,19 @@ class RawHead(nn.Module):
         return tuple(outs)
 
 
+def _pick(conv, channels, scale=1.0):
+    """Folded Conv (conv + act) -> a Conv with only the given output channels, weight and bias times scale."""
+    h = copy.deepcopy(conv)
+    h.conv.weight = nn.Parameter(conv.conv.weight[channels].detach().clone() * scale)
+    h.conv.bias = nn.Parameter(conv.conv.bias[channels].detach().clone() * scale)
+    h.conv.out_channels = len(channels)
+    return h
+
+
 def _halves(conv):
     """Folded Conv (conv + act) with 2c outputs -> two Convs with the first / second c outputs."""
-    parts = []
     c = conv.conv.out_channels // 2
-    for sl in (slice(0, c), slice(c, 2 * c)):
-        h = copy.deepcopy(conv)
-        h.conv.weight = nn.Parameter(conv.conv.weight[sl].detach().clone())
-        h.conv.bias = nn.Parameter(conv.conv.bias[sl].detach().clone())
-        h.conv.out_channels = c
-        parts.append(h)
-    return parts
+    return [_pick(conv, list(range(0, c))), _pick(conv, list(range(c, 2 * c)))]
 
 
 def _c2f_forward(self, x):
@@ -87,8 +90,38 @@ def split_cv1(model):
     return n
 
 
+def _attention_forward(self, x):
+    B, C, H, W = x.shape
+    N = H * W
+    q = self.q(x).view(B, self.num_heads, self.key_dim, N)
+    k = self.k(x).view(B, self.num_heads, self.key_dim, N)
+    v = self.v(x)
+    attn = (q.transpose(-2, -1) @ k).softmax(dim=-1)
+    x = (v.view(B, self.num_heads, self.head_dim, N) @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v)
+    return self.proj(x)
+
+
+def split_qkv(model):
+    """Replace the qkv conv + Split of every Attention (C2PSA / PSABlock) by separate q, k, v convs: same result
+    (the 1/sqrt(key_dim) scale is folded into q), but no Split, whose outputs nncase fetches on the CPU."""
+    from ultralytics.nn.modules.block import Attention
+
+    n = 0
+    for m in model.modules():
+        if isinstance(m, Attention):
+            per_head = 2 * m.key_dim + m.head_dim  # qkv channels: per head [q (key_dim), k (key_dim), v (head_dim)]
+            heads = [h * per_head for h in range(m.num_heads)]
+            m.q = _pick(m.qkv, [b + i for b in heads for i in range(m.key_dim)], m.scale)
+            m.k = _pick(m.qkv, [b + m.key_dim + i for b in heads for i in range(m.key_dim)])
+            m.v = _pick(m.qkv, [b + 2 * m.key_dim + i for b in heads for i in range(m.head_dim)])
+            del m.qkv
+            m.forward = types.MethodType(_attention_forward, m)
+            n += 1
+    return n
+
+
 def build(weights, split=True):
-    """Ultralytics checkpoint -> RawHead (eval, BatchNorm folded, input 0..255; split: see split_cv1)."""
+    """Ultralytics checkpoint -> RawHead (eval, BatchNorm folded, input 0..255; split: see split_cv1, split_qkv)."""
     from ultralytics import YOLO
 
     model = YOLO(weights).model.float().eval()
@@ -98,6 +131,7 @@ def build(weights, split=True):
         first.weight.mul_(1.0 / 255.0)  # zero padding: conv(x / 255, w) == conv(x, w / 255) exactly
     if split:
         print(f"split cv1 of {split_cv1(model)} C3k2 / C2PSA blocks into two convs")
+        print(f"split qkv of {split_qkv(model)} attention blocks into q, k, v convs")
     return RawHead(model).eval()
 
 
@@ -107,7 +141,7 @@ def main():
     ap.add_argument("output")
     ap.add_argument("--size", type=int, default=640, help="square input size (default 640)")
     ap.add_argument("--opset", type=int, default=13)
-    ap.add_argument("--keep-split", action="store_true", help="keep the cv1 chunk/split of C3k2 and C2PSA")
+    ap.add_argument("--keep-split", action="store_true", help="keep the cv1 chunk of C3k2 / C2PSA and the qkv split of attention")
     args = ap.parse_args()
 
     net = build(args.weights, split=not args.keep_split)
