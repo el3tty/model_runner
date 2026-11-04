@@ -25,8 +25,10 @@ Placeholders used below:
   dotnet build src/Nncase.Cli/Nncase.Cli.csproj -c Release
   ```
 
-  It is `src/Nncase.Cli/bin/Release/net9.0/Nncase.Cli.exe`. Arguments can be given in a response file, one
-  argument per line: `Nncase.Cli.exe @args.txt`.
+  It is `src/Nncase.Cli/bin/Release/net9.0/Nncase.Cli.exe`. Arguments can be given in a response file (one or more
+  per line, as in the compile blocks below): `Nncase.Cli.exe @args.txt`. Relative paths in it are relative to the
+  current directory (the blocks below assume this folder); `${here}` stands for the response file's folder, e.g.
+  `${here}/../kmodel/model.kmodel`.
 * Board: Python 3 with numpy and nncaseruntime. Copy `coco_run.py`, `run-model.py` and `util/`. The board clock may
   be wrong, so copy with `tar xmf` (does not restore modification times):
 
