@@ -495,3 +495,6 @@ pooling + Gemm, LSTM), runs `qat_graph.load` and `make_quantizable`, exports the
 exported graph, printed in a compact text form, with where the quantizers and shared ranges belong (the float16
 cases as nncase's quantized IR stores them); also the per-channel weight grid and the loading of a checkpoint of the
 earlier placement. Needs torch, onnx and onnx2torch.
+`tests/test_qat_calibrate.py` runs `qat_generic.calibrate` on the same models and compares every range group, for
+noclip and KLD, with the float tensors from onnxruntime; also the state after calibration and degenerate tensors.
+`kld_range` is compared with thresholds taken from nncase's own `Nncase.Quantization.dll`.
