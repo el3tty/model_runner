@@ -454,3 +454,13 @@ the dumps and how to read them: "Debug dumps and check points" in `<nncase>/src/
 ```
 python <nncase>/tools/ckpt_dump.py 'dumps/Runtime/1$1_7.ckpt/act_dm_write.chk' --kind P --record 0
 ```
+
+## Tests
+
+```
+python -m pytest tests
+```
+
+needs pytest. `tests/test_tensor_image.py` runs `tensor_from_image.py` and `tensor_to_image.py` on small generated
+images: layout, channel order, element types and value range, letterbox padding, transparency and EXIF orientation,
+the round trip back to the same bytes, rounding / clipping and the errors.
