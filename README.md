@@ -498,3 +498,7 @@ earlier placement. Needs torch, onnx and onnx2torch.
 `tests/test_qat_calibrate.py` runs `qat_generic.calibrate` on the same models and compares every range group, for
 noclip and KLD, with the float tensors from onnxruntime; also the state after calibration and degenerate tensors.
 `kld_range` is compared with thresholds taken from nncase's own `Nncase.Quantization.dll`.
+`tests/test_coco.py` runs `util/coco.py` on generated images, raw outputs and annotations: the input geometry of
+every detector against sizes worked out by hand, cells and candidates, NMS, the mapping back to the image, AP with
+known values, and a white rectangle followed from an image through to COCO results. Needs Pillow, OpenCV and
+pycocotools.
