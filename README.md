@@ -89,6 +89,25 @@ All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yol
 
    Without the five pre-process lines the kmodel takes float32 0..255 input (about 4 ms slower per image).
 
+   The original graph (the results' "original graph, float32 input" row):
+
+   ```
+   python yolo_to_onnx.py weights/yolo26n.pt onnx/yolo26n-640.onnx --keep-split
+   ```
+
+   ```
+   compile
+   --dataset calib300
+   --dataset-format Image
+   --calib-image-resize=Letterbox
+   --calib-bgr=false
+   --input-range 0 255
+   --model-quant-mode UsePTQ
+   onnx/yolo26n-640.onnx
+   kmodel/yolo26n-640-ptq.kmodel
+   k230
+   ```
+
 ### QAT: YOLOX-nano and the PP-OCR recognizer
 
 `qat_train.py <task>` fine-tunes a model for the K230's uint8 quantization; `yolox` and `ppocr` are the tasks. The
@@ -191,25 +210,39 @@ would have done). Fonts for the training lines:
 / Liberation fonts of a Linux system (`apt-get install fonts-dejavu-core fonts-liberation`).
 `python -m util.ocr_synth <dir>` writes a new test set.
 
-The export (`--act-qdq`) is the original graph operator for operator plus 80 Q/DQ pairs; it compiles like the PTQ
-build but without `--dataset` and the quant scheme options:
+The PTQ build (the float model, calibrated by nncase on `data/ocr-synth/calib`; uint8 BGR input, which the
+pre-process maps to -1..1):
 
 ```
 compile
---pre-process
-true
---input-type
-Uint8
---input-shape
-1 3 32 320
---input-layout
-NCHW
---model-layout
-NCHW
---input-range
--1 1
---model-quant-mode
-UsePTQ
+--dataset data/ocr-synth/calib
+--dataset-format Image
+--calib-image-resize=Letterbox
+--calib-bgr=true
+--pre-process true
+--input-type Uint8
+--input-shape 1 3 32 320
+--input-layout NCHW
+--model-layout NCHW
+--input-range -1 1
+--model-quant-mode UsePTQ
+onnx/ppocr-en-rec-32x320.onnx
+kmodel/ppocr-en-rec-32x320.kmodel
+k230
+```
+
+The export (`--act-qdq`) is the original graph operator for operator plus 80 Q/DQ pairs; it compiles like the PTQ
+build but without the four calibration lines:
+
+```
+compile
+--pre-process true
+--input-type Uint8
+--input-shape 1 3 32 320
+--input-layout NCHW
+--model-layout NCHW
+--input-range -1 1
+--model-quant-mode UsePTQ
 onnx/ppocr-en-rec-qat.onnx
 kmodel/ppocr-en-rec-qat.kmodel
 k230
