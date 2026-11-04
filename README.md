@@ -121,14 +121,22 @@ range groups, each at the same tensor). Then:
 | task | data | training | metric | export |
 |---|---|---|---|---|
 | `yolox` | COCO, YOLOX's pipeline (mosaic / mixup, off for the last `--no-aug-epochs` epochs, with the L1 loss) | YOLOX's loss (labels), SGD, `--lr` per 64 images, stem conv frozen | AP on val2017 | ONNX with Q/DQ pairs |
-| `ppocr` | text lines rendered on the fly (`util/ocr_synth.py`) | distillation: KL of the float and the fake-quant model's per-time-step class distributions (no labels), Adam | words / CER on `data/ocr-synth` | float ONNX + nncase quant scheme |
+| `ppocr` | text lines rendered on the fly (`util/ocr_synth.py`) | distillation: KL of the float and the fake-quant model's per-time-step class distributions (no labels), Adam | words / CER on `data/ocr-synth` | ONNX with Q/DQ pairs |
 
-`qat_export.py <task> <checkpoint> <output.onnx>` exports a checkpoint for nncase (the last column).
+`qat_export.py <task> <checkpoint> <output.onnx> --act-qdq` exports a checkpoint for nncase: the fake-quant model
+traced to ONNX, every quantized activation with a QuantizeLinear / DequantizeLinear pair holding its trained range,
+the weights baked onto their per-channel grid; `--float` exports the trained weights without any quantization. The
+ONNX file is all nncase needs: it reads the ranges from the Q/DQ pairs, so the compile takes no calibration dataset
+and no quant scheme file. `--weight-qdq` keeps per-channel Q/DQ nodes on the conv / gemm weights instead of baking
+them (the same values; for onnxruntime or inspection, nncase's ONNX import rejects per-channel Q/DQ). An LSTM is
+exported as one ONNX LSTM node (float weights, which nncase quantizes per row as the training did, and a Q/DQ pair on
+its output), not as the step loop the training runs. Runs on the CPU.
+To measure a Q/DQ model with onnxruntime, switch its graph optimizations off (`ORT_DISABLE_ALL`): they replace
+Q/DQ + Conv with integer kernels that round differently (PP-OCR: 0.932 words instead of 0.941).
 `python qat_train.py <task> -h` and `python qat_export.py <task> -h` list the options. The code: `util/qat_train.py`
 (training and export drivers, schedule, checkpoints), `util/qat_graph.py` (placement, ONNX import, quant scheme
 matching), `util/qat_generic.py` (fake-quant modules, nncase's range rules and calibration, ONNX export),
-`util/qat_yolox.py` and `util/qat_ppocr.py` (the tasks, with their exports), `util/ocr_synth.py` (text lines),
-`util/quant_scheme.py` (the `.qs.json` writer of the YOLOX export).
+`util/qat_yolox.py` and `util/qat_ppocr.py` (the tasks, with their exports), `util/ocr_synth.py` (text lines).
 
 #### YOLOX-nano
 
@@ -146,12 +154,8 @@ The first line calibrates on `--calib-images` (512) random train2017 images and 
 with BatchNorm folded its gradients are far too large for the shared lr).
 
 `qat_export.py yolox` exports `init.pth`, `best.pth` or `latest.pth` (checkpoints of the former `yolox_qat.py` /
-`yolox_qat_train.py` load too) to ONNX: input `1x3x416x416` float32 BGR 0..255, output `[1, 3549, 85]` without box
-decoding. The fake-quantized weights are baked into the conv weights (`--weight-qdq` keeps Q/DQ nodes on them
-instead); `--act-qdq` adds a Q/DQ pair with the trained range on every quantized activation; `--float` exports the
-trained weights without any quantization. It also writes nncase's quant scheme (`<output>.qs.json`) read back from
-the exported graph (`--no-scheme` skips it). Runs on the CPU. nncase reads the ranges from the Q/DQ nodes, so the
-compile needs no calibration dataset:
+`yolox_qat_train.py` load too): input `1x3x416x416` float32 BGR 0..255, output `[1, 3549, 85]` without box
+decoding. The compile:
 
 ```
 compile
@@ -172,30 +176,38 @@ k230
 ```
 python qat_train.py ppocr --epochs 0 --out qat_ppocr
 python qat_train.py ppocr --init qat_ppocr/init.pth -b 128 --epochs 20 --out qat_ppocr
-python qat_export.py ppocr qat_ppocr/best.pth onnx/ppocr-en-rec-qat.onnx --scheme QuantScheme.json
+python qat_export.py ppocr qat_ppocr/best.pth onnx/ppocr-en-rec-qat.onnx --act-qdq
 ```
 
 The calibrated model scores what the board does (PTQ: 0.853 words / CER 0.029, the board 0.855 / 0.029; float
-0.931 / 0.014). A 200-iteration pilot at `-b 64` reached 0.918 / 0.015, and the kmodel of a similar pilot 0.888 /
-0.023 on the K230 simulator (bit-exact with the board) against 0.855 / 0.029 for PTQ: the fake-quant numbers are
-about 0.02-0.03 words optimistic. The input is mapped like the K230's pre-process, `(x - 128) / 127.5` (nncase's
-integer zero point; PaddleOCR uses 127.5).
+0.931 / 0.014). The default run reached its best after 3 epochs: 0.942 / 0.0105 in PyTorch, and its kmodel 0.942 /
+0.0115 on the K230 simulator (bit-exact with the board), against 0.855 / 0.029 for the PTQ kmodel. The input is
+mapped like the K230's pre-process, `(x - 128) / 127.5` (nncase's integer zero point; PaddleOCR uses 127.5).
 
-Training speed: the LSTMs run step by step in Python, about 110 lines/s on a GTX 1060 at `-b 128` (`-b 256` does not
-fit in 6 GB); the default 20 x 1000 x 128 lines take about 6.5 hours there. Fonts for the training lines:
+Training speed: the LSTMs run step by step in Python, about 125 lines/s on a GTX 1060 at `-b 128` (`-b 256` does not
+fit in 6 GB); the default 20 x 1000 x 128 lines took 5.6 hours there (the best epoch was the third: `--epochs 5`
+would have done). Fonts for the training lines:
 `--fonts <dir>` (every `.ttf` / `.otf` in it), else the Windows fonts `data/ocr-synth` was made with, else the DejaVu
 / Liberation fonts of a Linux system (`apt-get install fonts-dejavu-core fonts-liberation`).
 `python -m util.ocr_synth <dir>` writes a new test set.
 
-`qat_export.py ppocr` writes the float ONNX with the trained weights and `<output>.qs.json`. The scheme template
-(`--scheme`) is nncase's QuantScheme.json of a PTQ compile of the float model (`--export-quant-scheme
---export-weight-range-by-channel --dump-dir <dir>`): it names every tensor nncase quantizes; the export replaces the
-activation ranges with the checkpoint's and the weight ranges with the trained weights' (per channel, as nncase
-computes them). A Q/DQ export as for YOLOX does not work here: an unrolled LSTM would not match nncase's LSTM.
-Compile it like the PTQ build, with the scheme instead of `--export-quant-scheme`:
+The export (`--act-qdq`) is the original graph operator for operator plus 80 Q/DQ pairs; it compiles like the PTQ
+build but without `--dataset` and the quant scheme options:
 
 ```
---quant-scheme=onnx/ppocr-en-rec-qat.onnx.qs.json
+compile
+--pre-process
+true
+--input-type
+Uint8
+--input-shape
+1 3 32 320
+--input-layout
+NCHW
+--model-layout
+NCHW
+--input-range
+-1 1
 --model-quant-mode
 UsePTQ
 onnx/ppocr-en-rec-qat.onnx
@@ -203,7 +215,8 @@ kmodel/ppocr-en-rec-qat.kmodel
 k230
 ```
 
-(with the same `--dataset`, `--pre-process true --input-type Uint8 --input-range -1 1` lines as the PTQ build).
+That needs an nncase whose Q/DQ import (`QdqQuantSchemePass`) handles LSTM and MatMul weights and the pre-processed
+input (the k230 branch of `<nncase>`); an older one fails on the LSTM with "Invalid w_quant_type".
 
 #### QAT training on RunPod
 

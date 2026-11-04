@@ -125,11 +125,50 @@ class QLinear(nn.Module):
         return F.linear(x, self.wq(self.linear.weight), self.linear.bias)
 
 
+def _lstm(x, w, r, b, hidden_size, reverse_dirs, h_q=None):
+    """ONNX LSTM (gates i, o, f, c) step by step; h_q quantizes the hidden state of every step."""
+    steps = x.shape[0]
+    ys, hs, cs = [], [], []
+    for d in range(w.shape[0]):
+        xw = x @ w[d].T + b[d, :4 * hidden_size] + b[d, 4 * hidden_size:]  # [T, B, 4H]
+        h = x.new_zeros(x.shape[1], hidden_size)
+        c = x.new_zeros(x.shape[1], hidden_size)
+        out = [None] * steps
+        for t in (reversed(range(steps)) if d in reverse_dirs else range(steps)):
+            i, o, f, g = (xw[t] + h @ r[d].T).split(hidden_size, -1)
+            c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+            h = torch.sigmoid(o) * torch.tanh(c)
+            if h_q is not None:
+                h = h_q(h)
+            out[t] = h
+        ys.append(torch.stack(out))
+        hs.append(h)
+        cs.append(c)
+    return torch.stack(ys, 1), torch.stack(hs), torch.stack(cs)
+
+
+class _OnnxLSTM(torch.autograd.Function):
+    """One ONNX LSTM node in an export (the step loop would otherwise be traced into thousands of nodes)."""
+
+    @staticmethod
+    def forward(ctx, x, w, r, b, hidden_size, direction):
+        reverse = {1} if direction == "bidirectional" else ({0} if direction == "reverse" else set())
+        return _lstm(x, w, r, b, hidden_size, reverse)
+
+    @staticmethod
+    def symbolic(g, x, w, r, b, hidden_size, direction):
+        return g.op("LSTM", x, w, r, b, hidden_size_i=hidden_size, direction_s=direction, outputs=3)
+
+
 class QLSTM(nn.Module):
     """ONNX LSTM (gates i, o, f, c; no peepholes; default activations) with the K230 fake quantization: W and R
     per output row (direction x gate x hidden unit), and the hidden state h quantized (out_q, one range for both
     directions) every time step: that is the tensor stored as Y and fed back into R * h. The cell state c and the
     gates stay float (fp16 on the KPU). The input x is quantized by its producer.
+
+    In an ONNX export it is one LSTM node with the float W, R, B (nncase quantizes them per row, as the training
+    did) followed by out_q on Y (a Q/DQ pair when activations are quantized): nncase maps that node onto the KPU's
+    LSTM, which quantizes h every step itself.
 
     w [D, 4H, I], r [D, 4H, H], b [D, 8H] as in ONNX; forward(x [T, B, I]) -> (Y [T, D, B, H], Y_h, Y_c [D, B, H])."""
 
@@ -147,26 +186,13 @@ class QLSTM(nn.Module):
         self.out_q = ActFakeQuant()
 
     def forward(self, x):
-        h_size = self.hidden_size
+        if torch.onnx.is_in_onnx_export():
+            y, yh, yc = _OnnxLSTM.apply(x, self.w, self.r, self.b, self.hidden_size, self.direction)
+            return self.out_q(y), yh, yc
         w = self.wq(self.w.reshape(-1, self.w.shape[-1])).reshape(self.w.shape)
         r = self.rq(self.r.reshape(-1, self.r.shape[-1])).reshape(self.r.shape)
-        steps = x.shape[0]
-        ys, hs, cs = [], [], []
-        for d in range(w.shape[0]):
-            xw = x @ w[d].T + self.b[d, :4 * h_size] + self.b[d, 4 * h_size:]  # [T, B, 4H]
-            h = x.new_zeros(x.shape[1], h_size)
-            c = x.new_zeros(x.shape[1], h_size)
-            out = [None] * steps
-            reverse = self.direction == "reverse" or d == 1
-            for t in (reversed(range(steps)) if reverse else range(steps)):
-                i, o, f, g = (xw[t] + h @ r[d].T).split(h_size, -1)
-                c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
-                h = self.out_q(torch.sigmoid(o) * torch.tanh(c))
-                out[t] = h
-            ys.append(torch.stack(out))
-            hs.append(h)
-            cs.append(c)
-        return torch.stack(ys, 1), torch.stack(hs), torch.stack(cs)
+        reverse = {1} if self.direction == "bidirectional" else ({0} if self.direction == "reverse" else set())
+        return _lstm(x, w, r, self.b, self.hidden_size, reverse, self.out_q)
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -345,42 +371,43 @@ def calibrate(model, loader, method="kld"):
 # export
 # ----------------------------------------------------------------------------------------------------------------------
 def bake_weights(model):
-    """Replace every conv weight by its fake-quantized (per-output-channel) value and switch the weight quantizer off,
-    so a following ONNX export has plain Conv nodes whose weights already lie on the quantization grid, with no
-    Constant -> QuantizeLinear -> DequantizeLinear chain in front of them. Returns an undo() function that restores
-    the original float weights and the quantizer state."""
+    """Replace every conv / linear weight by its fake-quantized (per-output-channel) value and switch the weight
+    quantizer off, so a following ONNX export has plain Conv / Gemm nodes whose weights already lie on the
+    quantization grid, with no Constant -> QuantizeLinear -> DequantizeLinear chain in front of them. Returns an
+    undo() function that restores the original float weights and the quantizer state. (QLSTM exports its float
+    weights anyway: an LSTM node takes no Q/DQ weights.)"""
     saved = []
     with torch.no_grad():
         for m in model.modules():
-            if isinstance(m, QConv2d) and m.wq.enabled:
-                w = m.conv.weight
-                saved.append((m, w.detach().clone()))
+            if isinstance(m, (QConv2d, QLinear)) and m.wq.enabled:
+                w = m.conv.weight if isinstance(m, QConv2d) else m.linear.weight
+                saved.append((m, w, w.detach().clone()))
                 scale, zp = weight_qparams(w)
                 w.copy_(torch.fake_quantize_per_channel_affine(w, scale, zp, 0, QMIN, QMAX))
                 m.wq.enabled = False
 
     def undo():
         with torch.no_grad():
-            for m, w in saved:
-                m.conv.weight.copy_(w)
+            for m, w, old in saved:
+                w.copy_(old)
                 m.wq.enabled = True
 
     return undo
 
 
 def export_onnx(model, input_shape, path, opset=13, new_exporter=False, example=None, quiet=False,
-                bake_conv_weights=False):
+                bake_conv_weights=False, input_names=("images",), output_names=("output",)):
     """Export a (fake-quant) model to ONNX in its current quantizer state: quantizers enabled -> QuantizeLinear/
     DequantizeLinear pairs (per-tensor on activations, per-channel on weights); disabled -> a plain float graph.
 
-    input_shape: e.g. (1, 3, 416, 416); the input is named "images", the output "output".
+    input_shape: e.g. (1, 3, 416, 416); input_names / output_names name the graph inputs / outputs.
     new_exporter: use the torch.export based exporter (PyTorch >= 2.5) instead of the legacy TorchScript one, which
         has the fake-quant -> Q/DQ symbolics.
     example: numpy array of input_shape (float32) used as the example input of the trace instead of zeros.
     quiet: hide the warnings that are expected here (the scales / zero points are meant to be constants of the
         exported graph, and the legacy exporter is chosen on purpose).
-    bake_conv_weights: fold the weight quantization into the conv weights (see bake_weights): the graph keeps
-        Q/DQ pairs on the activations only. The model is restored afterwards."""
+    bake_conv_weights: fold the weight quantization into the conv / linear weights (see bake_weights): the graph
+        keeps Q/DQ pairs on the activations only. The model is restored afterwards."""
     model.eval()
     device = next(model.parameters()).device
     input_shape = tuple(input_shape)
@@ -390,7 +417,8 @@ def export_onnx(model, input_shape, path, opset=13, new_exporter=False, example=
         if tuple(example.shape) != input_shape:
             raise SystemExit(f"example input has shape {tuple(example.shape)}, the model needs {input_shape}")
         dummy = torch.from_numpy(example).float().to(device)
-    kwargs = dict(input_names=["images"], output_names=["output"], opset_version=opset, do_constant_folding=True)
+    kwargs = dict(input_names=list(input_names), output_names=list(output_names), opset_version=opset,
+                  do_constant_folding=True)
     if "dynamo" in inspect.signature(torch.onnx.export).parameters:
         kwargs["dynamo"] = new_exporter  # the legacy TorchScript exporter has the fake-quant -> Q/DQ symbolics
     elif new_exporter:
@@ -407,7 +435,32 @@ def export_onnx(model, input_shape, path, opset=13, new_exporter=False, example=
     finally:
         if undo is not None:
             undo()
+    _bypass_constant_identities(path)
     print("exported", path)
+
+
+def _bypass_constant_identities(path):
+    """The exporter puts Identity nodes between some constants and their users (e.g. a scalar used by many ops);
+    nncase's fusion patterns want the constant itself (with them, the Add / Div of a spelled out HardSwish stay
+    unfused and run on the CPU). Rewire the users to the constant and drop those Identity nodes."""
+    import onnx
+
+    m = onnx.load(path)
+    g = m.graph
+    consts = {i.name for i in g.initializer} | {o for n in g.node if n.op_type == "Constant" for o in n.output}
+    outputs = {o.name for o in g.output}
+    alias = {n.output[0]: n.input[0] for n in g.node
+             if n.op_type == "Identity" and n.input[0] in consts and n.output[0] not in outputs}
+    if not alias:
+        return
+    keep = [n for n in g.node if not (n.op_type == "Identity" and n.output[0] in alias)]
+    for n in keep:
+        for i, x in enumerate(n.input):
+            if x in alias:
+                n.input[i] = alias[x]
+    del g.node[:]
+    g.node.extend(keep)
+    onnx.save(m, path)
 
 
 def dump_ranges(model, path):

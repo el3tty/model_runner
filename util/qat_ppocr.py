@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """The PP-OCR recognizer for QAT (qat_train.py ppocr, qat_export.py ppocr): the character set, greedy CTC decoding,
 edit distance, the labeled test set (data/ocr-synth: test/<i>.u8 1x3x32x320 BGR uint8 + labels.json), the
-calibration images, the export (float ONNX with the trained weights + nncase quant scheme) and PpocrTask."""
+calibration images and PpocrTask."""
 import json
 import os
 
 import numpy as np
-import onnx
 import torch
-from onnx import numpy_helper
 
 from util import qat_graph
 from util.ocr_synth import normalize
@@ -82,40 +80,6 @@ def distill_loss(student_logits, teacher_logits, temperature=1.0):
     s = F.log_softmax(student_logits.reshape(-1, c) / temperature, -1)
     t = F.softmax(teacher_logits.reshape(-1, c) / temperature, -1)
     return F.kl_div(s, t, reduction="batchmean") * temperature ** 2
-
-
-def trained_initializers(model, onnx_path):
-    """{initializer name: trained float32 array} for the ONNX initializers that are parameters of model (matched by
-    the values of a freshly converted, untrained model)."""
-    fresh = qat_graph.load(onnx_path)
-    fresh_params = {k: v.detach().numpy() for k, v in fresh.state_dict().items()}
-    trained = {k: v.detach().cpu().numpy() for k, v in model.state_dict().items()}
-    m = qat_graph.constants_to_initializers(onnx.load(onnx_path))
-    out = {}
-    for init in m.graph.initializer:
-        w = numpy_helper.to_array(init)
-        if w.dtype != np.float32 or w.size < 2:
-            continue
-        for key, v in fresh_params.items():
-            transposed = v.ndim == 2 and v.T.shape == w.shape and np.array_equal(v.T, w)
-            if not (v.shape == w.shape and np.array_equal(v, w)) and not transposed:
-                continue
-            head, _, leaf = key.rpartition(".")
-            for k in (key, f"{head}.conv.{leaf}", f"{head}.linear.{leaf}"):
-                if k in trained:
-                    out[init.name] = trained[k].T if transposed else trained[k]
-                    break
-            break
-    return m, out
-
-
-def channel_ranges(w, count):
-    """[(min, max)] of w per channel along the axis of size count (axis 0 first), or of the whole tensor."""
-    if count == 1:
-        return [(float(w.min()), float(w.max()))]
-    axis = next(a for a in range(w.ndim) if w.shape[a] == count)
-    flat = np.moveaxis(w, axis, 0).reshape(count, -1)
-    return list(zip(flat.min(1).tolist(), flat.max(1).tolist()))
 
 
 class PpocrTask(Task):
@@ -192,48 +156,16 @@ class PpocrTask(Task):
     def score(self, metrics):
         return metrics["words"], -metrics["CER"]
 
+    export_input_names = ("x",)
+    export_output_names = ("ctc_fc.tmp_1",)  # the names of the original model
+
+    def export_input_shape(self, args):
+        return (1, 3, 32, 320)
+
     def add_export_args(self, ap):
         ap.description = (
-            "The float recognizer with the trained weights (same graph, input and output as the training's --onnx; "
-            "the weights as float values: nncase quantizes them per output channel between min and max, the "
-            "training's fake quantization) and <output>.qs.json, the nncase quant scheme to compile it with "
-            "(--quant-scheme): --scheme with the checkpoint's activation ranges and the trained weights' per-channel "
-            "ranges. A Q/DQ export does not work for this model: an unrolled LSTM would not match nncase's LSTM.")
-        ap.add_argument("--scheme", default=None,
-                        help="nncase QuantScheme.json of a PTQ compile of the float model (--export-quant-scheme "
-                             "--export-weight-range-by-channel; it names every tensor nncase quantizes); default: "
-                             "the training's --scheme")
-
-    def export(self, model, ckpt, args):
-        onnx_path = ckpt["args"]["onnx"]
-        scheme_path = args.scheme or ckpt["args"].get("scheme")
-        if not scheme_path:
-            raise SystemExit("--scheme is needed: the checkpoint was not started from a quant scheme")
-        m, weights = trained_initializers(model, onnx_path)
-        for init in m.graph.initializer:
-            if init.name in weights:
-                init.CopyFrom(numpy_helper.from_array(weights[init.name].astype(np.float32), init.name))
-        onnx.checker.check_model(m)
-        onnx.save(m, args.output)
-        print(f"wrote {args.output} ({len(weights)} trained initializers)")
-
-        scheme = json.load(open(scheme_path))
-        names = qat_graph.match_scheme(qat_graph.make_quantizable(qat_graph.load(onnx_path)), onnx_path, scheme_path)
-        acts = {}
-        for qname, name in names:
-            p = model.get_submodule(qname).params
-            acts[name] = (float(p.min_val), float(p.max_val))
-        n_w = n_a = 0
-        for entry in scheme["Outputs"]:
-            if entry["Name"] in weights:
-                ranges = channel_ranges(weights[entry["Name"]], len(entry["DataRange"]))
-                entry["DataRange"] = [{"Min": lo, "Max": hi, "IsFull": False} for lo, hi in ranges]
-                n_w += 1
-            elif entry["Name"] in acts:
-                lo, hi = acts[entry["Name"]]
-                entry["DataRange"] = [{"Min": lo, "Max": hi, "IsFull": False}]
-                n_a += 1
-        with open(args.output + ".qs.json", "w") as f:
-            json.dump(scheme, f, indent=2)
-        print(f"wrote {args.output}.qs.json ({n_w} weight and {n_a} activation entries updated, "
-              f"{len(scheme['Outputs']) - n_w - n_a} kept)")
+            "ONNX of the fake-quant recognizer: input x 1x3x32x320 float32 (as the K230 pre-process maps the uint8 "
+            "image: (x - 128) / 127.5), output [1, 80, 97]. Each LSTM is one ONNX LSTM node with its float weights "
+            "(nncase quantizes them per row, as the training did) and a Q/DQ pair on its output with the trained "
+            "hidden-state range.")
+        super().add_export_args(ap)

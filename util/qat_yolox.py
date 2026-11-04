@@ -11,15 +11,12 @@ import copy
 import os
 import random
 import shutil
-import tempfile
 
-import numpy as np
 import torch
 import torch.fx
 import torch.nn as nn
 
 from util import qat_generic, qat_graph
-from util.qat_generic import describe, set_state
 from util.qat_train import Task
 
 
@@ -153,18 +150,6 @@ def evaluate(exp, model, batch_size):
     return ap50_95, ap50
 
 
-def export_onnx(exp, model, path, opset=13, new_exporter=False, example=None, quiet=False, bake_conv_weights=False):
-    """qat_generic.export_onnx without box decoding: input 1x3xHxW float32 raw 0..255 BGR, output [1, N, 85]."""
-    head = model.head
-    old_decode = head.decode_in_inference
-    head.decode_in_inference = False
-    try:
-        qat_generic.export_onnx(model, (1, 3, *exp.test_size), path, opset, new_exporter, example, quiet,
-                                bake_conv_weights)
-    finally:
-        head.decode_in_inference = old_decode
-
-
 class YoloxTask(Task):
     """YOLOX on COCO with YOLOX's own training recipe and loss (labels)."""
 
@@ -263,50 +248,25 @@ class YoloxTask(Task):
         ap50_95, ap50 = evaluate(self.exp(args), model, args.eval_batch_size)
         return {"AP": ap50_95, "AP50": ap50}
 
+    export_input_names = ("images",)
+    export_output_names = ("output",)
+
+    def export_input_shape(self, args):
+        return (1, 3, *self.exp(args).test_size)
+
     def add_export_args(self, ap):
         ap.description = (
             "ONNX of the fake-quant model: input 1x3xHxW float32 (raw 0..255 BGR), output [1, N, 85] without box "
-            "decoding (raw dx, dy, log w, log h, sigmoid objectness, sigmoid class scores). By default the per-channel "
-            "weight quantization is baked into the Conv weights (fake-quantized float values), so every Conv is a "
-            "plain Conv node; --act-qdq puts QuantizeLinear/DequantizeLinear pairs with the trained ranges on the "
-            "activations. Unless --float or --no-scheme, nncase's quant scheme is written to <output>.qs.json, read "
-            "back from the Q/DQ nodes (util/quant_scheme.py). Runs on the CPU.")
+            "decoding (raw dx, dy, log w, log h, sigmoid objectness, sigmoid class scores).")
         ap.add_argument("-n", "--name", default="yolox-nano", help="YOLOX experiment name (older checkpoints)")
         ap.add_argument("-f", "--exp-file", default=None, help="YOLOX experiment file (older checkpoints)")
-        ap.add_argument("--opset", type=int, default=13, help="ONNX opset (per-channel Q/DQ needs >= 13)")
-        ap.add_argument("--new-exporter", action="store_true",
-                        help="use the torch.export based exporter (PyTorch >= 2.5; untested with fake-quant, try "
-                             "--opset 18; check the result with run-onnx.py)")
-        ap.add_argument("--example", default=None, metavar="FILE",
-                        help="raw f32 1x3xHxW tensor file used as the example input of the export instead of zeros")
-        ap.add_argument("--weight-qdq", action="store_true",
-                        help="keep Constant -> QuantizeLinear -> DequantizeLinear in front of every Conv weight "
-                             "instead of baking the weight quantization into the weights")
-        ap.add_argument("--act-qdq", action="store_true",
-                        help="QuantizeLinear -> DequantizeLinear pairs (the trained ranges) on the activations")
-        ap.add_argument("--no-scheme", action="store_true", help="do not write the nncase quant scheme")
-        ap.add_argument("--float", action="store_true", help="export without any quantization (the trained weights)")
+        super().add_export_args(ap)
 
-    def export(self, model, ckpt, args):
-        from util.quant_scheme import write_scheme
-
-        exp = self.exp(args)
-        set_state(model, weights=not args.float, acts=args.act_qdq and not args.float)
-        print(describe(model))
-        example = None
-        if args.example:
-            example = np.fromfile(args.example, dtype="<f4").reshape(1, 3, *exp.test_size)
-        export_onnx(exp, model, args.output, args.opset, args.new_exporter, example, quiet=True,
-                    bake_conv_weights=not args.weight_qdq)
-        if args.float or args.no_scheme:
-            return
-        if args.act_qdq:
-            write_scheme(args.output, args.output + ".qs.json")
-            return
-        # the activation ranges are in the graph only as Q/DQ pairs: read them from a temporary export that has them
-        set_state(model, weights=True, acts=True)
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_onnx = os.path.join(tmp, "act-qdq.onnx")
-            export_onnx(exp, model, tmp_onnx, args.opset, args.new_exporter, example, quiet=True,
-                        bake_conv_weights=not args.weight_qdq)
-            write_scheme(tmp_onnx, args.output + ".qs.json")
+    def export_onnx(self, model, path, args, example):
+        head = model.head
+        old_decode = head.decode_in_inference
+        head.decode_in_inference = False
+        try:
+            super().export_onnx(model, path, args, example)
+        finally:
+            head.decode_in_inference = old_decode

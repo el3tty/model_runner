@@ -92,13 +92,51 @@ class Task:
         """Sort key of metrics (larger is better) for best.pth."""
         return tuple(metrics.values())
 
+    # qat_export.py: the fake-quant model traced to ONNX; quantizers -> QuantizeLinear / DequantizeLinear pairs
+    export_input_names = ("input",)
+    export_output_names = ("output",)
+
+    def export_input_shape(self, args):
+        """Required for qat_export.py: the shape of the model input, batch 1."""
+        raise NotImplementedError
+
     def add_export_args(self, ap):
-        """The task's qat_export.py arguments."""
+        """qat_export.py arguments (a task adds its own and calls this)."""
+        ap.add_argument("--act-qdq", action="store_true",
+                        help="QuantizeLinear -> DequantizeLinear pairs with the trained ranges on the activations "
+                             "(nncase reads them as its quant scheme and needs no calibration data); without it the "
+                             "activations stay float and the trained ranges are not in the file")
+        ap.add_argument("--weight-qdq", action="store_true",
+                        help="keep Constant -> QuantizeLinear -> DequantizeLinear in front of the conv / gemm "
+                             "weights instead of baking the weight quantization into the weights (same values; "
+                             "for onnxruntime / inspection: nncase's ONNX import rejects per-channel Q/DQ)")
+        ap.add_argument("--float", action="store_true", help="no quantization at all (the trained float weights)")
+        ap.add_argument("--opset", type=int, default=13, help="ONNX opset (per-channel Q/DQ needs >= 13)")
+        ap.add_argument("--new-exporter", action="store_true",
+                        help="use the torch.export based exporter (PyTorch >= 2.5; untested with fake-quant)")
+        ap.add_argument("--example", default=None, metavar="FILE",
+                        help="raw float32 input tensor file used as the example input of the trace instead of zeros")
+
+    def export_onnx(self, model, path, args, example):
+        """Trace model to ONNX at path (a task may wrap this, e.g. to switch its output decoding off)."""
+        from util.qat_graph import static_batch
+
+        with static_batch(model):
+            qat_generic.export_onnx(model, self.export_input_shape(args), path, args.opset, args.new_exporter, example,
+                                    quiet=True, bake_conv_weights=not args.weight_qdq,
+                                    input_names=self.export_input_names, output_names=self.export_output_names)
 
     def export(self, model, ckpt, args):
-        """Required for qat_export.py. Write args.output (and whatever nncase needs with it) from the loaded model
-        (eval mode, quantizers on) and its checkpoint."""
-        raise NotImplementedError
+        """Write args.output from the loaded model (eval mode)."""
+        import numpy as np
+
+        set_state(model, weights=not args.float, acts=args.act_qdq and not args.float)
+        print(describe(model))
+        example = None
+        if args.example:
+            example = np.fromfile(args.example, dtype="<f4").reshape(self.export_input_shape(args))
+        model.cpu()
+        self.export_onnx(model, args.output, args, example)
 
 
 def format_metrics(metrics):

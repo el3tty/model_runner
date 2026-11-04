@@ -17,6 +17,7 @@ load() also turns Constant weights into initializers and makes a constant batch 
 takes the activation ranges from an nncase quant scheme. The fake-quant modules, the calibration and the export are
 those of qat_generic.py.
 """
+import contextlib
 import functools
 import json
 
@@ -68,6 +69,38 @@ def _convert_lstm(node, graph):
                                     onnx_mapping=OnnxMapping(inputs=(ins[0],), outputs=tuple(node.output_values)))
 
 
+class _HardSigmoidFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha, beta):
+        return torch.clip(x * alpha + beta, 0.0, 1.0)
+
+    @staticmethod
+    def symbolic(g, x, alpha, beta):
+        return g.op("HardSigmoid", x, alpha_f=alpha, beta_f=beta)
+
+
+class HardSigmoid(nn.Module):
+    """ONNX HardSigmoid, clip(alpha * x + beta, 0, 1), exported as one HardSigmoid node (onnx2torch's module traces to
+    Mul / Add / Clip, which nncase does not fuse: they would run on the CPU)."""
+
+    def __init__(self, alpha=0.2, beta=0.5):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+
+    def forward(self, x):
+        if torch.onnx.is_in_onnx_export():
+            return _HardSigmoidFn.apply(x, self.alpha, self.beta)
+        return torch.clip(x * self.alpha + self.beta, 0.0, 1.0)
+
+
+def _replace_modules(gm):
+    """Modules of onnx2torch that would not export back to the same ONNX op, replaced by ones that do."""
+    for name, m in list(gm.named_modules()):
+        if type(m).__name__ == "OnnxHardSigmoid":
+            _set_module(gm, name, HardSigmoid(m.alpha, m.beta))
+
+
 def constants_to_initializers(model):
     """Constant nodes -> initializers (onnx2torch takes Conv / Gemm / LSTM weights from initializers only)."""
     g = model.graph
@@ -84,8 +117,9 @@ def constants_to_initializers(model):
 
 def _dynamic_batch(model):
     """Reshapes to a constant shape that starts with the model's batch size 1 (and has no -1) get -1 there, so the
-    converted model takes any batch size."""
+    converted model takes any batch size. Returns the model and the changed shapes."""
     g = model.graph
+    changed = []
     inits = {i.name: i for i in g.initializer}
     for n in g.node:
         if n.op_type != "Reshape" or n.input[1] not in inits:
@@ -97,13 +131,36 @@ def _dynamic_batch(model):
             name = n.input[1] + "_dynamic_batch"
             g.initializer.append(numpy_helper.from_array(shape, name))
             n.input[1] = name
-    return model
+            changed.append(shape)
+    return model, changed
 
 
 def load(path):
     """onnx2torch GraphModule of the float ONNX model at path (BatchNorm must already be folded into the convs), for
-    any batch size."""
-    return convert(_dynamic_batch(constants_to_initializers(onnx.load(path))))
+    any batch size (static_batch() restores the model's own reshapes for an export)."""
+    model, changed = _dynamic_batch(constants_to_initializers(onnx.load(path)))
+    gm = convert(model)
+    _replace_modules(gm)
+    gm.dynamic_batch_buffers = [n for n, b in gm.named_buffers() if b.dtype in (torch.int64, torch.int32)
+                                and any(b.numel() == len(c) and b.tolist() == c.tolist() for c in changed)]
+    return gm
+
+
+@contextlib.contextmanager
+def static_batch(model):
+    """The reshape shapes load() made dynamic (-1) back to the model's batch size 1, for an ONNX export (nncase wants
+    the static shapes of the original model). Any model works: one without such reshapes is left alone."""
+    buffers = []
+    for m in model.modules():
+        for name in getattr(m, "dynamic_batch_buffers", []):
+            buffers.append(m.get_buffer(name))
+    for b in buffers:
+        b[0] = 1
+    try:
+        yield model
+    finally:
+        for b in buffers:
+            b[0] = -1
 
 
 class _Graph:
