@@ -1,6 +1,6 @@
 """
 YOLO post-processing shared by run-model.py (K230 board / simulator) and run-onnx.py (onnxruntime): decoding, NMS and
-drawing, for the detector heads selected with --detect:
+drawing, for the detector heads selected with --postprocess (util/postprocess.py):
 
   yolox         the raw YOLOX head output [1, N, 85] = (dx, dy, log w, log h per grid cell, strides 8/16/32,
                 objectness, 80 class scores), as exported without box decoding (qat_export.py yolox). Input BGR, 0..255.
@@ -21,7 +21,7 @@ output is matched to its stride by its grid size, not by its name or position (t
 swapped: out_stride16 is the 10x10 grid, stride 32).
 
 score = objectness * best class score. draw() draws the boxes that survive --score-thr and class-aware NMS on the input
-image (colored by score, with the score to 3 decimals above each box) and writes <prefix><detect>.rgb (e.g.
+image (colored by score, with the score to 3 decimals above each box) and writes <prefix><model>.rgb (e.g.
 outputyolox.rgb): a raw tensor with exactly the layout, element type and size of the input. Input may be u8, u16, f16
 or f32 as 1x3xHxW or 1xHxWx3, in the channel order and value range of the model (see above).
 tensor_to_image.py turns the result into an image (--bgr for yolox, --scale 1 for the 0..1 models).
@@ -262,24 +262,13 @@ def draw_detections(hwc, dets, bgr):
     return img
 
 
-def add_arguments(parser):
-    """Add the detection options shared by run-model.py and run-onnx.py to an argparse parser."""
-    parser.add_argument("--detect", choices=sorted(MODELS), default=None,
-                        help="decode the outputs as raw heads of this detector, draw the boxes on the input and save "
-                             "<prefix><detect>.rgb (raw, same layout, channel order, value range and element type as "
-                             "the input); yolox: BGR 0..255 input, yolov3 / yolo-fastest: RGB 0..1, yolo26: RGB "
-                             "0..255")
-    parser.add_argument("--score-thr", type=float, default=0.25,
-                        help="with --detect: minimum objectness*class score (default 0.25)")
-    parser.add_argument("--nms-thr", type=float, default=0.45,
-                        help="with --detect: NMS IoU threshold (default 0.45)")
-
-
 def draw(args, data, outs):
-    """Decode the raw outputs `outs` of the --detect model, draw the detections on the input `data`, save raw."""
-    model = MODELS[args.detect]
+    """Decode the raw outputs `outs` of the --postprocess detector, draw the detections on the input `data`, save
+    raw."""
+    model_name = args.postprocess
+    model = MODELS[model_name]
     if data.dtype.kind not in "uf" or data.ndim != 4 or 3 not in (data.shape[1], data.shape[3]):
-        print(f"error: --detect needs an image input (1x3xHxW or 1xHxWx3, u8/u16/f16/f32), "
+        print(f"error: --postprocess {model_name} needs an image input (1x3xHxW or 1xHxWx3, u8/u16/f16/f32), "
               f"got {data.dtype} {list(data.shape)}")
         return 1
     nchw = data.shape[1] == 3
@@ -288,13 +277,13 @@ def draw(args, data, outs):
     # draw on a u8 copy (0..255)
     hwc = np.clip(np.rint(orig.astype(np.float32) * (255.0 / white)), 0, 255).astype(np.uint8)
     if hwc.max() <= 1 and white == 255.0:
-        print(f"warning: all input values are <= 1, but {args.detect} expects 0..255")
+        print(f"warning: all input values are <= 1, but {model_name} expects 0..255")
     elif orig.max() > 1.5 and white == 1.0:
-        print(f"warning: input values up to {float(orig.max()):g}, but {args.detect} expects 0..1")
+        print(f"warning: input values up to {float(orig.max()):g}, but {model_name} expects 0..1")
     try:
         det = model["decode"]([np.asarray(o) for o in outs], hwc.shape[0], hwc.shape[1], model["anchors"])
     except ValueError as e:
-        print(f"error: {args.detect}: {e}")
+        print(f"error: {model_name}: {e}")
         return 1
     dets = detect(det, args.score_thr, args.nms_thr)
     print(f"\n{len(dets)} detection(s) with score >= {args.score_thr}:")
@@ -309,7 +298,7 @@ def draw(args, data, outs):
         merged[drawn] = (img[drawn].astype(np.float32) * (white / 255.0)).astype(data.dtype)
         img = merged
     res = np.ascontiguousarray(img.transpose(2, 0, 1)[None] if nchw else img[None])
-    path = f"{args.output_prefix}{args.detect}.rgb"
+    path = f"{args.output_prefix}{model_name}.rgb"
     res.tofile(path)
     print(f"saved {os.path.abspath(path)}: raw {res.dtype} {list(res.shape)} ({res.nbytes} bytes), "
           f"colors by score: <0.4 red, <0.6 orange, <0.8 yellow, >=0.8 green")

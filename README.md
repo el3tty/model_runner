@@ -38,12 +38,16 @@ Placeholders used below:
 
 ## Models
 
-| `--detect` | Model | Input |
+The name is the `--postprocess` of `run-onnx.py` / `run-model.py` and, for the detectors, the `--detect` of the
+COCO scripts.
+
+| Name | Model | Input |
 |---|---|---|
-| `yolox` | [YOLOX-nano](#yolox-nano-qat) | 416×416, BGR 0..255, letterbox top-left, pad 114 |
+| `yolox` | [YOLOX-nano](#yolox-nano) | 416×416, BGR 0..255, letterbox top-left, pad 114 |
 | `yolov3` | [YOLOv3](#yolov3-and-yolo-fastest) | 416×416, RGB 0..1, letterbox centered, pad 128 |
 | `yolo-fastest` | [Yolo-Fastest 1.1](#yolov3-and-yolo-fastest) | 320×320, RGB 0..1, plain resize |
 | `yolo26` | [YOLO26n](#yolo26n) | 640×640, RGB 0..255, letterbox centered, pad 114 |
+| `ppocr` | [PP-OCR recognizer](#pp-ocr-recognizer) | 320×32, one text line, BGR; uint8 (kmodel) or -1..1 (ONNX) |
 
 All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yolo_post.py` decodes them.
 
@@ -343,10 +347,11 @@ k230
 
 ## One image
 
-`tensor_from_image.py` writes the raw input tensor, `run-onnx.py` / `run-model.py` run the model, draw the
-detections into a tensor of the same layout, and `tensor_to_image.py` turns it into an image:
+`tensor_from_image.py` writes the raw input tensor, `run-onnx.py` / `run-model.py` run the model and, with
+`--postprocess <detector>`, draw the detections into a tensor of the same layout, and `tensor_to_image.py` turns it
+into an image:
 
-| `--detect` | `tensor_from_image.py` options | `tensor_to_image.py` options |
+| `--postprocess` | `tensor_from_image.py` options | `tensor_to_image.py` options |
 |---|---|---|
 | `yolox` | `416x416 --letterbox --bgr --type f32` | `416x416 f32 --bgr` |
 | `yolov3` | `416x416 --letterbox --pad 128 --range 1 --type f32` | `416x416 f32 --range 1` |
@@ -357,7 +362,7 @@ Example (YOLO26):
 
 ```
 python tensor_from_image.py data/test.jpg 640x640 --letterbox --pad 114 --type f32 --output data/yolo26/yolo26-f32.in
-python run-onnx.py onnx/yolo26n-640-nosplit.onnx data/yolo26/yolo26-f32.in --detect yolo26 --output-prefix=data/yolo26/out-onnx-
+python run-onnx.py onnx/yolo26n-640-nosplit.onnx data/yolo26/yolo26-f32.in --postprocess yolo26 --output-prefix=data/yolo26/out-onnx-
 python tensor_to_image.py data/yolo26/out-onnx-yolo26.rgb 640x640 f32 --format bmp --output data/yolo26/out-onnx-yolo26.bmp
 ```
 
@@ -365,10 +370,24 @@ On the board (or in the simulator) with the u8 kmodel:
 
 ```
 python tensor_from_image.py data/test.jpg 640x640 --letterbox --pad 114 --type u8 --output data/yolo26/yolo26-u8.in
-python3 run-model.py yolo26n-640-nosplit-u8-ptq.kmodel yolo26-u8.in --detect yolo26 --output-prefix out-
+python3 run-model.py yolo26n-640-nosplit-u8-ptq.kmodel yolo26-u8.in --postprocess yolo26 --output-prefix out-
 ```
 
 These single-image inputs use Pillow's resize, so they differ slightly from the COCO inputs below.
+
+Text recognition (PP-OCR): `--postprocess ppocr` decodes the CTC output and prints the text (`util/ocr_post.py`). The
+input is a uint8 BGR `1x3x32x320` text line, e.g. a `data/ocr-synth/test/*.u8` file (labels in
+`data/ocr-synth/labels.json`) or `tensor_from_image.py <line image> 320x32 --bgr` (plain resize: crop the image
+to one line of text first). The kmodel (built with `--pre-process`) takes the file as it is; `run-onnx.py
+--input-range -1 1` maps it like the kmodel's pre-process, `(x - 128) / 127.5`, for the float or QAT ONNX:
+
+```
+python run-onnx.py onnx/ppocr-en-rec-qat.onnx data/ocr-synth/test/0001.u8 --input-range -1 1 --postprocess ppocr
+python run-model.py kmodel/ppocr-en-rec-qat.kmodel data/ocr-synth/test/0001.u8 --postprocess ppocr
+```
+
+`run-onnx.py` runs onnxruntime without graph optimizations, which would turn the Q/DQ pairs of a QAT export into
+integer kernels that round differently.
 
 ## COCO val2017 AP
 

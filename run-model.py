@@ -13,22 +13,29 @@ The input file is raw bytes, with no header, laid out exactly as the model
 expects (e.g. 1x3x416x416 NCHW or 1x416x416x3 NHWC): its size must equal the
 model's input size. The expected shape and size are printed on error.
 
-With --detect yolox|yolov3|yolo-fastest the outputs are treated as the raw
-heads of that detector and decoded to boxes (util/yolo_post.py, which also
-gives the input channel order and value range each detector expects);
-score = objectness * best class score. Boxes above --score-thr (after NMS)
-are drawn on the input image, colored by score, with the score (3 decimals)
-above each box. The result is written to <prefix><detect>.rgb as a raw tensor
-with exactly the layout, element type and size of the input (e.g. 1x3x416x416).
-Input may be u8, u16, f16 or f32 (as the model expects).
+--postprocess <model> post-processes the outputs (util/postprocess.py):
+
+  yolox, yolov3, yolo-fastest, yolo26: the outputs are the raw heads of that
+  detector, decoded to boxes (util/yolo_post.py, which also gives the input
+  channel order and value range each detector expects); score = objectness *
+  best class score. Boxes above --score-thr (after NMS) are drawn on the input
+  image, colored by score, with the score (3 decimals) above each box. The
+  result is written to <prefix><model>.rgb as a raw tensor with exactly the
+  layout, element type and size of the input (e.g. 1x3x416x416). Input may be
+  u8, u16, f16 or f32 (as the model expects).
+  ppocr: the output is decoded as the CTC logits of the PP-OCR recognizer and
+  the text is printed (util/ocr_post.py); the kmodel built with --pre-process
+  takes the uint8 BGR 1x3x32x320 image (e.g. data/ocr-synth/test/*.u8).
 
 Usage:
     python run-model.py model.kmodel input.in [--output-prefix output] [--dump-outputs]
-                        [--dump-root rt-dumps] [--detect yolox|yolov3|yolo-fastest]
+                        [--dump-root rt-dumps]
+                        [--postprocess yolox|yolov3|yolo-fastest|yolo26|ppocr]
 
 Example:
-    python run-model.py yolox-qat.kmodel yolox-f32-bgr.in --output-prefix out_ --detect yolox --dump-outputs
+    python run-model.py yolox-qat.kmodel yolox-f32-bgr.in --output-prefix out_ --postprocess yolox --dump-outputs
     # -> out_0.txt, out_1.txt, ..., out_yolox.rgb
+    python run-model.py ppocr-en-rec-qat.kmodel 0000.u8 --postprocess ppocr
 """
 
 import argparse
@@ -39,7 +46,7 @@ import time
 import numpy as np
 import nncaseruntime as nn
 
-from util import yolo_post
+from util import postprocess
 from util.common import save_tensor_text
 
 
@@ -64,12 +71,12 @@ def parse_args():
     parser.add_argument("input", help="raw input tensor file (element type and layout as the model expects, e.g. u8 or f32)")
     parser.add_argument("--output-prefix", default="output",
                         help="prefix of the files written: <prefix>0.txt, <prefix>1.txt, ... with --dump-outputs, "
-                             "<prefix><detect>.rgb with --detect (default: output)")
+                             "<prefix><model>.rgb with --postprocess for a detector (default: output)")
     parser.add_argument("--dump-outputs", action="store_true",
                         help="save each output tensor as text, <prefix><index>.txt, one value per line")
     parser.add_argument("--dump-root", default="rt-dumps",
                         help="folder for runtime dumps (default: rt-dumps)")
-    yolo_post.add_arguments(parser)
+    postprocess.add_arguments(parser)
     return parser.parse_args()
 
 
@@ -135,9 +142,7 @@ def main():
             save_tensor_text(path, out)
             print(f"  saved {os.path.abspath(path)} ({out.size} values)")
 
-    if args.detect:
-        return yolo_post.draw(args, data, outs)
-    return 0
+    return postprocess.run(args, data, outs)
 
 
 if __name__ == "__main__":
