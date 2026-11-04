@@ -470,3 +470,8 @@ detections with them: every stride, per-class NMS, the score threshold, outputs 
 `tests/test_ocr_post.py` does the same for `--postprocess ppocr`: text encoded as CTC logits (repeats, blanks, every
 character, the longest line), the printed text and confidence, and the errors; one test compares the built-in
 character set with the PaddleOCR model's metadata and is skipped without `weights/ppocr`.
+`tests/test_qat_graph.py` writes small models in ONNX text syntax (conv / activation chains, SiLU and HardSwish
+patterns, MaxPool, Concat, nearest Resize, residual Add, squeeze-excitation, pooling + Gemm, LSTM), runs
+`qat_graph.load` and `make_quantizable`, exports them with `--act-qdq` and compares the exported graph, printed in a
+compact text form, with where the quantizers and shared ranges belong; also the per-channel weight grid. Needs
+torch, onnx and onnx2torch.
