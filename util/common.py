@@ -1,5 +1,16 @@
-"""Helpers shared by run-model.py and run-onnx.py."""
+"""Helpers shared by run-model.py, run-onnx.py and coco_run.py."""
+import os
+import tempfile
+
 import numpy as np
+
+
+def temp_dump_root(kmodel):
+    """A new folder for the runtime dumps of one run of kmodel: <system temp>/nncase-rt-dumps/<kmodel name>-XXXXXXXX.
+    An interpreter without a dump root writes its dumps to the current directory."""
+    parent = os.path.join(tempfile.gettempdir(), "nncase-rt-dumps")
+    os.makedirs(parent, exist_ok=True)
+    return tempfile.mkdtemp(prefix=os.path.splitext(os.path.basename(kmodel))[0] + "-", dir=parent)
 
 
 def save_tensor_text(path, array):

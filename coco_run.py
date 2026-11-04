@@ -22,6 +22,7 @@ import nncaseruntime as nn
 
 from util import coco as cu
 from util import yolo_post
+from util.common import temp_dump_root
 
 
 def read_uncached(path):
@@ -46,7 +47,8 @@ def main():
                     help="keep cells with objectness * best class score >= CONF (default: the model's evaluation "
                          "threshold, util/coco.py PREP; coco_eval.py cannot use a lower one)")
     ap.add_argument("--limit", type=int, default=0, help="first N images only (default: 0 = all)")
-    ap.add_argument("--dump-root", default=None, help="folder for runtime dumps, if the runtime writes any")
+    ap.add_argument("--dump-root", default=None, help="folder for runtime dumps, if the runtime writes any "
+                                                      "(default: a new folder under <system temp>/nncase-rt-dumps)")
     args = ap.parse_args()
 
     meta = cu.load_index(args.input)
@@ -58,9 +60,9 @@ def main():
     white = yolo_post.MODELS[model]["white"]
 
     kpu = nn.Interpreter()
-    if args.dump_root:
-        os.makedirs(args.dump_root, exist_ok=True)
-        kpu.set_dump_root(args.dump_root)
+    dump_root = args.dump_root or temp_dump_root(args.kmodel)
+    os.makedirs(dump_root, exist_ok=True)
+    kpu.set_dump_root(dump_root)
     with open(args.kmodel, "rb") as f:
         kpu.load_model(f.read())
     shape = list(kpu.get_input_shape(0))

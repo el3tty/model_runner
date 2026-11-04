@@ -6,8 +6,8 @@ Loads a kmodel, feeds it a raw uint8 tensor read from a file, runs one
 inference and prints a summary of each output tensor; with --dump-outputs it
 also writes each output to <prefix><index>.txt, one value per line (row-major
 order). Runtime dumps (text/rdata/in/out etc., if the runtime was built
-with DUMP_K230_INVOCATIONS / ENABLE_DUMP_MANAGER) go to a separate folder
-instead of the current directory.
+with DUMP_K230_INVOCATIONS / ENABLE_DUMP_MANAGER) go to a new folder under
+<system temp>/nncase-rt-dumps, or to --dump-root, never to the current directory.
 
 The input file is raw bytes, with no header, laid out exactly as the model
 expects (e.g. 1x3x416x416 NCHW or 1x416x416x3 NHWC): its size must equal the
@@ -29,7 +29,7 @@ model's input size. The expected shape and size are printed on error.
 
 Usage:
     python run-model.py model.kmodel input.in [--output-prefix output] [--dump-outputs]
-                        [--dump-root rt-dumps]
+                        [--dump-root DIR]
                         [--postprocess yolox|yolov3|yolo-fastest|yolo26|ppocr]
 
 Example:
@@ -47,7 +47,7 @@ import numpy as np
 import nncaseruntime as nn
 
 from util import postprocess
-from util.common import save_tensor_text
+from util.common import save_tensor_text, temp_dump_root
 
 
 class ScopedTiming:
@@ -74,8 +74,8 @@ def parse_args():
                              "<prefix><model>.rgb with --postprocess for a detector (default: output)")
     parser.add_argument("--dump-outputs", action="store_true",
                         help="save each output tensor as text, <prefix><index>.txt, one value per line")
-    parser.add_argument("--dump-root", default="rt-dumps",
-                        help="folder for runtime dumps (default: rt-dumps)")
+    parser.add_argument("--dump-root", default=None,
+                        help="folder for runtime dumps (default: a new folder under <system temp>/nncase-rt-dumps)")
     postprocess.add_arguments(parser)
     return parser.parse_args()
 
@@ -89,9 +89,10 @@ def main():
     kpu = nn.Interpreter()
 
     # Keep runtime dumps out of the current directory.
-    os.makedirs(args.dump_root, exist_ok=True)
-    kpu.set_dump_root(args.dump_root)
-    print(f"dump root: {os.path.abspath(args.dump_root)}")
+    dump_root = args.dump_root or temp_dump_root(args.kmodel)
+    os.makedirs(dump_root, exist_ok=True)
+    kpu.set_dump_root(dump_root)
+    print(f"dump root: {os.path.abspath(dump_root)}")
 
     with open(args.kmodel, "rb") as f:
         kmodel = f.read()
