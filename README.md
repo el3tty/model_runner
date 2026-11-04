@@ -461,6 +461,9 @@ python <nncase>/tools/ckpt_dump.py 'dumps/Runtime/1$1_7.ckpt/act_dm_write.chk' -
 python -m pytest tests
 ```
 
-needs pytest. `tests/test_tensor_image.py` runs `tensor_from_image.py` and `tensor_to_image.py` on small generated
-images: layout, channel order, element types and value range, letterbox padding, transparency and EXIF orientation,
-the round trip back to the same bytes, rounding / clipping and the errors.
+needs pytest; no data files or models. `tests/test_tensor_image.py` runs `tensor_from_image.py` and
+`tensor_to_image.py` on small generated images: layout, channel order, element types and value range, letterbox
+padding, transparency and EXIF orientation, the round trip back to the same bytes, rounding / clipping and the
+errors. `tests/test_yolo_post.py` encodes known boxes into the raw head outputs of every `--postprocess` detector
+(YOLOX, YOLOv3, Yolo-Fastest, YOLO26 split / joined / DFL; square and rectangular inputs) and compares the printed
+detections with them: every stride, per-class NMS, the score threshold, outputs in any order, and the errors.
