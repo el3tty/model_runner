@@ -1,0 +1,8 @@
+# Exports and QAT. For CUDA, install torch and torchvision from the PyTorch index first (see README.md).
+# YOLOX QAT also needs the yolox package, installed from its repository.
+-r requirements.txt
+torch
+torchvision
+onnx2torch
+onnxsim
+ultralytics

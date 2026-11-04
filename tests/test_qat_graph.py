@@ -16,6 +16,9 @@ import onnx
 import onnx.parser
 import pytest
 
+pytest.importorskip("torch")  # requirements-qat.txt
+pytest.importorskip("onnx2torch")
+
 from util import qat_generic, qat_graph
 
 pytestmark = [pytest.mark.filterwarnings("ignore::UserWarning"),  # onnx2torch's notes on Resize modes

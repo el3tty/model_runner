@@ -15,8 +15,22 @@ Placeholders used below:
 
 ## Requirements
 
-* PC: Python 3, numpy, opencv-python, Pillow, onnxruntime, onnx, pycocotools. For the exports: torch,
-  ultralytics (YOLO26), the `yolox` package (YOLOX QAT), onnxsim (`ppocr_to_onnx.py`). For QAT: torch (CUDA), onnx2torch.
+* PC: Python 3. For running models, the COCO evaluation and the tests:
+
+  ```
+  pip install -r requirements.txt
+  ```
+
+  For the exports and QAT, torch with CUDA first, then the rest (without torch, its tests are skipped):
+
+  ```
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+  pip install -r requirements-qat.txt
+  ```
+
+  YOLOX QAT also needs the `yolox` package, from its repository (see [the RunPod commands](#qat-training-on-runpod)).
+  `run-model.py` and `coco_run.py` need `nncaseruntime` from the nncase build: a link to its `nncaseruntime` folder
+  in this folder is enough, e.g. to `<nncase>/build-rel/install/nncaseruntime`.
 * nncase compiler: build the CLI in Release (calibration runs the model in nncase's own evaluator, about 5 s per
   image and pass even in Release):
 

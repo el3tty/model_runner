@@ -1,0 +1,9 @@
+# Running models, COCO evaluation and post-processing on the PC.
+# nncaseruntime is not here: it comes from the nncase build (see README.md).
+numpy
+opencv-python
+pillow
+onnx
+onnxruntime
+pycocotools
+pytest

@@ -11,6 +11,10 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 import pytest
+
+pytest.importorskip("torch")  # requirements-qat.txt
+pytest.importorskip("onnx2torch")
+
 import torch
 from torch import nn
 
