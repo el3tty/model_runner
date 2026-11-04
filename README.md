@@ -467,3 +467,6 @@ padding, transparency and EXIF orientation, the round trip back to the same byte
 errors. `tests/test_yolo_post.py` encodes known boxes into the raw head outputs of every `--postprocess` detector
 (YOLOX, YOLOv3, Yolo-Fastest, YOLO26 split / joined / DFL; square and rectangular inputs) and compares the printed
 detections with them: every stride, per-class NMS, the score threshold, outputs in any order, and the errors.
+`tests/test_ocr_post.py` does the same for `--postprocess ppocr`: text encoded as CTC logits (repeats, blanks, every
+character, the longest line), the printed text and confidence, and the errors; one test compares the built-in
+character set with the PaddleOCR model's metadata and is skipped without `weights/ppocr`.
