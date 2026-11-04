@@ -47,8 +47,11 @@ class Task:
         raise NotImplementedError
 
     def load_state_dict(self, model, state_dict):
-        """Load a checkpoint's model state (a task may convert older formats here)."""
-        model.load_state_dict(state_dict)
+        """Load a checkpoint's model state (a task may convert older formats here; checkpoints of the earlier
+        quantizer placement are converted for every task, see qat_graph.upgrade_state_dict)."""
+        from util.qat_graph import upgrade_state_dict
+
+        model.load_state_dict(upgrade_state_dict(model, state_dict))
 
     def calib_loader(self, args):
         """Required for calibration. Batches whose [0] is the model input, as the K230 sees it."""

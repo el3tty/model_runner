@@ -11,7 +11,7 @@ defaults are the model's own evaluation settings (util/coco.py PREP): yolox conf
 
 Usage:
     python coco_eval.py --input coco-yolox dets-yolox.npz [more.npz ...] [--onnx yolox.onnx ...]
-                        [--coco ..\\YOLOX\\datasets\\COCO] [--conf C] [--nms T] [--max-dets 100] [--limit N]
+                        --coco <COCO> (or $COCO_DIR) [--conf C] [--nms T] [--max-dets 100] [--limit N]
 """
 import argparse
 import contextlib
@@ -25,7 +25,6 @@ import numpy as np
 from util import coco as cu
 from util import yolo_post
 
-DEFAULT_COCO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "YOLOX", "datasets", "COCO")
 
 
 def load_candidates(path):
@@ -84,8 +83,10 @@ def main():
     ap.add_argument("--input", required=True, help="folder written by coco_prepare.py (index.json, <id>.u8)")
     ap.add_argument("--onnx", action="append", default=[], help="ONNX model to evaluate on the same inputs "
                                                                 "(repeatable)")
-    ap.add_argument("--coco", default=os.environ.get("COCO_DIR", DEFAULT_COCO),
-                    help="COCO root with annotations/ (default: $COCO_DIR or ../YOLOX/datasets/COCO)")
+    # the COCO 2017 dataset root (cocodataset.org: val2017/ images, annotations/instances_val2017.json); the
+    # ground truth of the evaluation
+    ap.add_argument("--coco", default=os.environ.get("COCO_DIR"), required="COCO_DIR" not in os.environ,
+                    help="COCO root with annotations/ (default: $COCO_DIR)")
     ap.add_argument("--conf", type=float, default=None, help="score threshold (default: the model's, see above)")
     ap.add_argument("--nms", type=float, default=None, help="NMS IoU threshold (default: the model's)")
     ap.add_argument("--multi-label", choices=("on", "off"), default=None,

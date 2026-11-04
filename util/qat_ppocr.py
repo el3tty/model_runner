@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""The PP-OCR recognizer for QAT (qat_train.py ppocr, qat_export.py ppocr): the character set, greedy CTC decoding,
-edit distance, the labeled test set (data/ocr-synth: test/<i>.u8 1x3x32x320 BGR uint8 + labels.json), the
-calibration images and PpocrTask."""
+"""The PP-OCR recognizer for QAT (qat_train.py ppocr, qat_export.py ppocr): edit distance, the labeled test set and
+the calibration images (a folder written by python -m util.ocr_synth: labels.json, test/<i>.u8 1x3x32x320 BGR uint8,
+calib/*.png) and PpocrTask. The character set and the greedy CTC decoding are util/ocr_post.py's."""
 import json
 import os
 
@@ -9,26 +9,9 @@ import numpy as np
 import torch
 
 from util import qat_graph
+from util.ocr_post import PPOCR_CHARS, decode
 from util.ocr_synth import normalize
 from util.qat_train import Task
-
-
-def charset(dict_onnx):
-    """Classes of the recognizer: blank, the characters of the original model's 'character' metadata, space."""
-    import onnx
-
-    meta = {p.key: p.value for p in onnx.load(dict_onnx).metadata_props}
-    return ["<blank>"] + [c for c in meta["character"].split("\n") if c] + [" "]
-
-
-def decode(logits, chars):
-    """Greedy CTC: argmax per time step, merge repeats, drop the blank (0)."""
-    out, prev = [], 0
-    for c in logits.argmax(-1):
-        if c != prev and c != 0:
-            out.append(chars[c])
-        prev = c
-    return "".join(out)
 
 
 def edit(a, b):
@@ -50,13 +33,13 @@ def load_test(synth_dir, limit=0):
 
 
 @torch.no_grad()
-def evaluate(model, x, texts, chars, batch=100):
+def evaluate(model, x, texts, chars=PPOCR_CHARS, batch=100):
     """(exact word accuracy, character error rate) of model on the test set."""
     device = next(model.parameters()).device
     preds = []
     for i in range(0, len(x), batch):
         out = model(torch.from_numpy(x[i:i + batch]).to(device)).float().cpu().numpy()
-        preds += [decode(o, chars) for o in out]
+        preds += [decode(o, chars)[0] for o in out]
     words = sum(p == t for p, t in zip(preds, texts)) / len(texts)
     cer = sum(edit(p, t) for p, t in zip(preds, texts)) / sum(len(t) for t in texts)
     return words, cer
@@ -97,11 +80,12 @@ class PpocrTask(Task):
     supports_scheme = True
 
     def add_args(self, ap):
-        ap.add_argument("--onnx", default="onnx/ppocr-en-rec-32x320.onnx", help="float recognizer (1x3x32x320)")
-        ap.add_argument("--dict", default="weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx",
-                        help="the original PaddleOCR ONNX (its 'character' metadata is the character set)")
-        ap.add_argument("--test", default="data/ocr-synth", help="labeled test set (labels.json, test/*.u8)")
-        ap.add_argument("--calib-dir", default="data/ocr-synth/calib", help="calibration images (nncase's --dataset)")
+        # the float recognizer, made by ppocr_to_onnx.py (input x 1x3x32x320, output the CTC logits [1, 80, 97]):
+        # the model the fake quantizers go into, and the teacher of the distillation
+        ap.add_argument("--onnx", required=True, help="float recognizer, e.g. onnx/ppocr-en-rec-32x320.onnx")
+        # written by python -m util.ocr_synth <dir>: test/*.u8 + labels.json (the words / CER evaluation), calib/*.png
+        # (the activation range calibration, the images nncase's --dataset would get)
+        ap.add_argument("--data", required=True, help="text line folder of util.ocr_synth, e.g. data/ocr-synth")
         ap.add_argument("--fonts", default=None, help="directory with .ttf/.otf fonts for the training lines")
         ap.add_argument("--temperature", type=float, default=1.0, help="distillation temperature")
         ap.add_argument("--seed", type=int, default=0, help="seed of the training lines")
@@ -110,7 +94,7 @@ class PpocrTask(Task):
         return qat_graph.make_quantizable(qat_graph.load(args.onnx)).to(device)
 
     def calib_loader(self, args):
-        return load_calib(args.calib_dir)
+        return load_calib(os.path.join(args.data, "calib"))
 
     def load_scheme(self, model, args):
         return qat_graph.load_scheme_ranges(model, args.onnx, args.scheme)
@@ -148,9 +132,9 @@ class PpocrTask(Task):
 
     def evaluate(self, model, args):
         if not hasattr(self, "_test"):
-            self._test = load_test(args.test), charset(args.dict)
-        (x, texts), chars = self._test
-        words, cer = evaluate(model, x, texts, chars)
+            self._test = load_test(args.data)
+        x, texts = self._test
+        words, cer = evaluate(model, x, texts)
         return {"words": words, "CER": cer}
 
     def score(self, metrics):

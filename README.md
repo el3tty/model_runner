@@ -7,7 +7,7 @@ Placeholders used below:
 
 | Placeholder | Meaning |
 |---|---|
-| `<COCO>` | COCO root with `train2017/`, `val2017/`, `annotations/`. The scripts default to `../YOLOX/datasets/COCO` (relative to this folder), or `$COCO_DIR` |
+| `<COCO>` | COCO 2017 root with `train2017/`, `val2017/`, `annotations/` (from [cocodataset.org](https://cocodataset.org/#download): the train / val 2017 images and the 2017 train/val annotations). The COCO scripts take it as `--coco`, or `$COCO_DIR` when that is set |
 | `<nncase>` | nncase checkout (K230 branch) |
 | `<board>` | the board's address; `<bdir>` a working folder on it |
 
@@ -16,7 +16,7 @@ Placeholders used below:
 ## Requirements
 
 * PC: Python 3, numpy, opencv-python, Pillow, onnxruntime, onnx, pycocotools. For the exports: torch,
-  ultralytics (YOLO26), the `yolox` package (YOLOX QAT). For QAT: torch (CUDA), onnx2torch.
+  ultralytics (YOLO26), the `yolox` package (YOLOX QAT), onnxsim (`ppocr_to_onnx.py`). For QAT: torch (CUDA), onnx2torch.
 * nncase compiler: build the CLI in Release (calibration runs the model in nncase's own evaluator, about 5 s per
   image and pass even in Release):
 
@@ -124,15 +124,20 @@ quantizes, by graph rules, on a `torch.fx` graph (YOLOX: the float model traced;
 * quantized ops: Conv (weights per output channel), Gemm (weights per output feature), LSTM, AveragePool /
   GlobalAveragePool, Add / Mul of two tensors (residual adds, squeeze-excitation scaling);
 * an activation that is the only consumer of a quantized op fuses into it (ReLU, Clip, Sigmoid, HardSigmoid, SiLU,
-  HardSwish, also when spelled out as several ops); the activation output is the stored tensor;
+  HardSwish, also when spelled out as several ops); the activation output is the stored tensor. An activation that
+  shares the op's result with other readers fuses too: nncase gives it its own copy of the op;
 * a stored tensor is fake-quantized (uint8, per tensor) when a quantized op reads it, directly or through ops that
   keep the quantization grid (MaxPool, nearest Resize / Upsample, Concat, slicing, Reshape, Transpose, ...); the
-  inputs of a Concat share one range (nncase unites concat ranges); the model input is not quantized;
+  inputs of a Concat share one range (nncase unites concat ranges); the model input is not quantized. Except a
+  Conv / Gemm output without an activation that only Add / Mul read: the K230 keeps it in float16 (nncase's
+  quantized IR stores it f32 and loads it f16), so it stays float here too (PP-OCR: the 7 MobileNetV3 project convs
+  into the residual Adds; YOLOX: none);
 * the LSTM (`QLSTM`): the KPU runs it with uint8 x, W, R (per row) and hidden state, and an fp16 cell state; the
   fake-quant version quantizes the hidden state at every time step (the tensor stored as Y and fed back).
 
 For YOLOX these rules give exactly the placement of the former hand-written code (111 activation quantizers in 99
-range groups, each at the same tensor). Then:
+range groups, each at the same tensor). Checkpoints made before the float16 rule (PP-OCR: 80 activation quantizers,
+now 73) load with their ranges moved to the remaining quantizers. Then:
 
 1. the activation ranges: calibrated like nncase's PTQ (`--calib kld`, nncase's default KL divergence of 8192-bin
    histograms, or `noclip` = min / max), on the float network and the input as the K230 sees it; that gives nncase's
@@ -193,14 +198,29 @@ k230
 
 #### PP-OCR recognizer
 
-`onnx/ppocr-en-rec-32x320.onnx` (MobileNetV3 with squeeze-excitation blocks, two bidirectional LSTMs, CTC; input
-`1x3x32x320`, output `[1, 80, 97]`). Needs the original PaddleOCR ONNX
-`weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx` (its metadata holds the character set), the calibration images
-`data/ocr-synth/calib` (nncase's `--dataset`) and the labeled test set `data/ocr-synth` (1000 lines):
+The PaddleOCR English / number recognizer en_number_mobile_v2.0 (PP-OCRv1: MobileNetV3 with squeeze-excitation
+blocks, two bidirectional LSTMs, CTC over 97 classes). The inputs:
+
+* `onnx/ppocr-en-rec-32x320.onnx`, the float model (`--onnx`): RapidOCR's ONNX of it, cut before the final Softmax
+  (output: the CTC logits `[1, 80, 97]`) and made static `1x3x32x320` by `ppocr_to_onnx.py` (needs onnxsim):
+
+  ```
+  curl -L -o weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv1/en_number_mobile_v2.0_rec_infer.onnx
+  python ppocr_to_onnx.py weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx onnx/ppocr-en-rec-32x320.onnx
+  ```
+
+  The character set (the model's `character` metadata) is built into `util/ocr_post.py`.
+* `data/ocr-synth`, rendered text lines (`--data`): `test/*.u8` with `labels.json` (1000 lines, the words / CER
+  evaluation) and `calib/*.png` (100 lines, the range calibration and nncase's `--dataset`). The fonts are those of
+  the training lines (below); the set used for the results here was rendered with the Windows fonts:
+
+  ```
+  python -m util.ocr_synth data/ocr-synth
+  ```
 
 ```
-python qat_train.py ppocr --epochs 0 --out qat_ppocr
-python qat_train.py ppocr --init qat_ppocr/init.pth -b 128 --epochs 20 --out qat_ppocr
+python qat_train.py ppocr --onnx onnx/ppocr-en-rec-32x320.onnx --data data/ocr-synth --epochs 0 --out qat_ppocr
+python qat_train.py ppocr --onnx onnx/ppocr-en-rec-32x320.onnx --data data/ocr-synth --init qat_ppocr/init.pth -b 128 --epochs 20 --out qat_ppocr
 python qat_export.py ppocr qat_ppocr/best.pth onnx/ppocr-en-rec-qat.onnx --act-qdq
 ```
 
@@ -214,7 +234,6 @@ fit in 6 GB); the default 20 x 1000 x 128 lines took 5.6 hours there (the best e
 would have done). Fonts for the training lines:
 `--fonts <dir>` (every `.ttf` / `.otf` in it), else the Windows fonts `data/ocr-synth` was made with, else the DejaVu
 / Liberation fonts of a Linux system (`apt-get install fonts-dejavu-core fonts-liberation`).
-`python -m util.ocr_synth <dir>` writes a new test set.
 
 The PTQ build (the float model, calibrated by nncase on `data/ocr-synth/calib`; uint8 BGR input, which the
 pre-process maps to -1..1):
@@ -266,12 +285,12 @@ with a network volume (`/workspace` survives pod restarts; everything else does 
 `<pod-ip>` and `<port>` from the pod's Connect page, `<key>` the SSH key added to RunPod.
 
 On the PC, pack this repository (git bundle: no remote needed) and copy it with what the task needs (YOLOX: the float
-checkpoint; PP-OCR: the two ONNX files and `data/ocr-synth`, about 40 MB):
+checkpoint; PP-OCR: the float model and `data/ocr-synth`, about 40 MB):
 
 ```
 git bundle create model_runner.bundle master
 scp -i <key> -P <port> model_runner.bundle yolox_nano.pth root@<pod-ip>:/workspace/
-scp -i <key> -P <port> onnx/ppocr-en-rec-32x320.onnx weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx root@<pod-ip>:/workspace/
+scp -i <key> -P <port> onnx/ppocr-en-rec-32x320.onnx root@<pod-ip>:/workspace/
 scp -i <key> -P <port> -r data/ocr-synth root@<pod-ip>:/workspace/
 ssh -i <key> -p <port> root@<pod-ip>
 ```
@@ -284,7 +303,7 @@ On the pod: system packages, this repository and its PP-OCR files; for YOLOX als
 apt-get update && apt-get install -y libgl1 libglib2.0-0 tmux unzip rsync fonts-dejavu-core fonts-liberation
 pip install onnx onnxruntime onnx2torch pillow
 cd /workspace && git clone model_runner.bundle model_runner && cd model_runner
-mkdir -p onnx weights/ppocr data && mv ../ppocr-en-rec-32x320.onnx onnx/ && mv ../en_number_mobile_v2.0_rec_infer.onnx weights/ppocr/ && mv ../ocr-synth data/ && mv ../yolox_nano.pth .
+mkdir -p onnx data && mv ../ppocr-en-rec-32x320.onnx onnx/ && mv ../ocr-synth data/ && mv ../yolox_nano.pth .
 cd /workspace && git clone https://github.com/Megvii-BaseDetection/YOLOX && cd YOLOX
 sed -i '/onnx-simplifier/d' requirements.txt && pip install -r requirements.txt && pip install -v -e . --no-build-isolation
 mkdir -p /workspace/datasets/COCO && cd /workspace/datasets/COCO
@@ -307,7 +326,7 @@ tmux new -s qat
 export YOLOX_DATADIR=/workspace/datasets
 cd /workspace/model_runner
 python qat_train.py yolox -c yolox_nano.pth --epochs 15 --workers 8 --eval-first --out qat_yolox 2>&1 | tee train-yolox.log
-python qat_train.py ppocr -b 128 --epochs 20 --workers 8 --eval-first --out qat_ppocr 2>&1 | tee train-ppocr.log
+python qat_train.py ppocr --onnx onnx/ppocr-en-rec-32x320.onnx --data data/ocr-synth -b 128 --epochs 20 --workers 8 --eval-first --out qat_ppocr 2>&1 | tee train-ppocr.log
 ```
 
 If the pod restarts, continue with `--resume <out>/latest.pth` and the same other arguments. `nvidia-smi -l 1` shows
@@ -471,7 +490,8 @@ detections with them: every stride, per-class NMS, the score threshold, outputs 
 character, the longest line), the printed text and confidence, and the errors; one test compares the built-in
 character set with the PaddleOCR model's metadata and is skipped without `weights/ppocr`.
 `tests/test_qat_graph.py` writes small models in ONNX text syntax (conv / activation chains, SiLU and HardSwish
-patterns, MaxPool, Concat, nearest Resize, residual Add, squeeze-excitation, pooling + Gemm, LSTM), runs
-`qat_graph.load` and `make_quantizable`, exports them with `--act-qdq` and compares the exported graph, printed in a
-compact text form, with where the quantizers and shared ranges belong; also the per-channel weight grid. Needs
-torch, onnx and onnx2torch.
+patterns, MaxPool, Concat, nearest Resize, residual Adds, an activation beside another reader, squeeze-excitation,
+pooling + Gemm, LSTM), runs `qat_graph.load` and `make_quantizable`, exports them with `--act-qdq` and compares the
+exported graph, printed in a compact text form, with where the quantizers and shared ranges belong (the float16
+cases as nncase's quantized IR stores them); also the per-channel weight grid and the loading of a checkpoint of the
+earlier placement. Needs torch, onnx and onnx2torch.

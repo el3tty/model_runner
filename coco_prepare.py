@@ -12,7 +12,7 @@ Every image becomes <output>/<image id>.u8 (1x3xHxW, 0..255; the 0..1 models get
 coco_eval.py), plus <output>/index.json with the original sizes and the box mapping back to the original image.
 
 Usage:
-    python coco_prepare.py --detect yolox --output coco-yolox [--coco ..\\YOLOX\\datasets\\COCO] [--images 5000]
+    python coco_prepare.py --detect yolox --output coco-yolox --coco <COCO> (or $COCO_DIR) [--images 5000]
 """
 import argparse
 import json
@@ -23,15 +23,16 @@ import numpy as np
 
 from util import coco as cu
 
-DEFAULT_COCO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "YOLOX", "datasets", "COCO")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--detect", required=True, choices=sorted(cu.PREP), help="detector whose preprocessing to use")
     ap.add_argument("--output", required=True, help="folder for the <id>.u8 tensors and index.json")
-    ap.add_argument("--coco", default=os.environ.get("COCO_DIR", DEFAULT_COCO),
-                    help="COCO root with val2017/ and annotations/ (default: $COCO_DIR or ../YOLOX/datasets/COCO)")
+    # the COCO 2017 dataset root (cocodataset.org: val2017/ images, annotations/instances_val2017.json); the
+    # ground truth and the images of the prepared inputs
+    ap.add_argument("--coco", default=os.environ.get("COCO_DIR"), required="COCO_DIR" not in os.environ,
+                    help="COCO root with val2017/ and annotations/ (default: $COCO_DIR)")
     ap.add_argument("--images", type=int, default=0, help="first N val2017 images (default: 0 = all 5000)")
     args = ap.parse_args()
 

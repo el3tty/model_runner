@@ -156,8 +156,8 @@ v7 = Resize(v6, #)
 v8 = Concat(v3, v7)
 y = Conv(v8, #, #)"""),
 
-    # Add of two tensors is a quantized op: both inputs quantized (the conv output without an activation too), and
-    # its fused Relu output read by the next conv
+    # Add of two tensors is a quantized op; its fused Relu output is read by the next conv. The conv output without
+    # an activation that only the Add reads stays float (float16 on the K230: GNNEStore f32 -> GNNELoad f16)
     "residual_add": ("""
 g (float[1,4,8,8] x, float[4,4,3,3] w1, float[4] b1, float[4,4,3,3] w2, float[4] b2, float[4,4,1,1] w3, float[4] b3)
   => (float[1,4,8,8] y) {
@@ -172,11 +172,74 @@ v1 = Conv(x, #, #)
 v2 = Relu(v1)
 v3 = Q0(v2)
 v4 = Conv(v3, #, #)
+v5 = Add(v3, v4)
+v6 = Relu(v5)
+v7 = Q1(v6)
+y = Conv(v7, #, #)"""),
+
+    # residual blocks in a row: both plain conv outputs stay float, the Add output read by a conv and an Add is
+    # quantized (as nncase does)
+    "add_chain": ("""
+g (float[1,4,8,8] x, float[4,4,3,3] w0, float[4] b0, float[4,4,3,3] w1, float[4] b1, float[4,4,3,3] w2, float[4] b2,
+   float[4,4,1,1] w3, float[4] b3) => (float[1,4,8,8] y) {
+  c0 = Conv <pads=[1,1,1,1]> (x, w0, b0)
+  r0 = Relu(c0)
+  c1 = Conv <pads=[1,1,1,1]> (r0, w1, b1)
+  a1 = Add(r0, c1)
+  c2 = Conv <pads=[1,1,1,1]> (a1, w2, b2)
+  a2 = Add(a1, c2)
+  y = Conv (a2, w3, b3)
+}""", """
+v1 = Conv(x, #, #)
+v2 = Relu(v1)
+v3 = Q0(v2)
+v4 = Conv(v3, #, #)
+v5 = Add(v3, v4)
+v6 = Q1(v5)
+v7 = Conv(v6, #, #)
+v8 = Add(v6, v7)
+v9 = Q2(v8)
+y = Conv(v9, #, #)"""),
+
+    # a plain conv output that a conv reads too is quantized, and the Add reads the quantized tensor
+    "plain_conv_to_add_and_conv": ("""
+g (float[1,4,8,8] x, float[4,4,3,3] w0, float[4] b0, float[4,4,3,3] w1, float[4] b1, float[4,4,1,1] w2, float[4] b2,
+   float[4,8,1,1] w3, float[4] b3) => (float[1,4,8,8] y) {
+  c0 = Conv <pads=[1,1,1,1]> (x, w0, b0)
+  r0 = Relu(c0)
+  c1 = Conv <pads=[1,1,1,1]> (r0, w1, b1)
+  a = Add(r0, c1)
+  c2 = Conv (c1, w2, b2)
+  k = Concat <axis=1> (a, c2)
+  y = Conv (k, w3, b3)
+}""", """
+v1 = Conv(x, #, #)
+v2 = Relu(v1)
+v3 = Q0(v2)
+v4 = Conv(v3, #, #)
 v5 = Q1(v4)
 v6 = Add(v3, v5)
-v7 = Relu(v6)
-v8 = Q2(v7)
-y = Conv(v8, #, #)"""),
+v7 = Q2(v6)
+v8 = Conv(v5, #, #)
+v9 = Q2(v8)
+v10 = Concat(v7, v9)
+y = Conv(v10, #, #)"""),
+
+    # Relu shares the conv output with an Add: nncase duplicates the conv, one copy with the Relu fused (stored
+    # uint8: quantized), one plain copy for the Add (float16: not quantized)
+    "activation_beside_another_reader": ("""
+g (float[1,4,8,8] x, float[4,4,3,3] w1, float[4] b1, float[4,4,1,1] w2, float[4] b2) => (float[1,4,8,8] y) {
+  c1 = Conv <pads=[1,1,1,1]> (x, w1, b1)
+  r1 = Relu(c1)
+  a = Add(c1, r1)
+  y = Conv (a, w2, b2)
+}""", """
+v1 = Conv(x, #, #)
+v2 = Relu(v1)
+v3 = Q0(v2)
+v4 = Add(v1, v3)
+v5 = Q1(v4)
+y = Conv(v5, #, #)"""),
 
     # HardSwish spelled out as (x * Clip(x + 3, 0, 6)) / 6 is one activation: no quantizer inside it
     "hardswish_mul_div": ("""
@@ -304,3 +367,23 @@ def test_weights_are_quantized_per_channel(tmp_path):
         q = fq / scale + zp
         assert np.allclose(q, np.round(q), atol=1e-3) and q.min() > -0.5 and q.max() < 255.5
         assert len(np.unique(scale)) == len(w)
+
+
+def test_checkpoint_of_the_earlier_placement(tmp_path):
+    """A state dict numbered over the earlier points (the plain conv output into the Add had a quantizer) loads into
+    the current model: each range lands on the same tensor, the dropped quantizer's range is discarded."""
+    import torch
+
+    src = tmp_path / "in.onnx"
+    build(CASES["residual_add"][0], src)
+    gm = qat_graph.make_quantizable(qat_graph.load(str(src)))
+    assert gm.legacy_actq == [0, None, 1]  # earlier: Relu output, plain conv output, Add+Relu output
+    state = {k: v for k, v in gm.state_dict().items() if not k.startswith("actq_")}
+    for i in range(3):
+        state[f"actq_{i}.params.min_val"] = torch.tensor(-1.0)
+        state[f"actq_{i}.params.max_val"] = torch.tensor(float(i + 1))
+        state[f"actq_{i}.params.seen"] = torch.tensor(1)
+    gm.load_state_dict(qat_graph.upgrade_state_dict(gm, state))
+    assert [float(gm.get_submodule(f"actq_{j}").params.max_val) for j in range(2)] == [1.0, 3.0]
+    current = gm.state_dict()
+    assert qat_graph.upgrade_state_dict(gm, current) is current  # a current checkpoint is left alone

@@ -8,9 +8,12 @@ The quantizers go where the K230 compile path quantizes, by graph rules, so a ne
     tensors, AveragePool / GlobalAveragePool;
   * an activation that is the only consumer of a quantized op's result fuses into it (Relu, LeakyRelu, Clip, Sigmoid,
     HardSigmoid, HardSwish, SiLU = Mul(x, Sigmoid(x)) and HardSwish spelled out as x * Clip(x + 3, 0, 6) / 6): the
-    tensor the hardware stores is the activation output;
-  * that stored tensor gets an activation fake-quant if a quantized op reads it, directly or through ops that keep
+    tensor the hardware stores is the activation output. An activation that shares the result with other readers
+    fuses too: nncase gives it its own copy of the op, so its output is a stored tensor as well;
+  * a stored tensor gets an activation fake-quant if a quantized op reads it, directly or through ops that keep
     the quantization grid (MaxPool, nearest Resize, Concat, Slice, Reshape, Transpose, Flatten, Squeeze, Unsqueeze);
+    except a Conv / Gemm output without an activation that only Add / Mul read: nncase keeps it in float16 (checked
+    in its quantized IR: e.g. a MobileNetV3 project conv into the residual Add);
   * the inputs of a Concat share one range (nncase unites concat ranges), so do the tensors a grid keeping op
     connects; the model input is not quantized (it is uint8 already).
 load() also turns Constant weights into initializers and makes a constant batch size of 1 dynamic; load_scheme_ranges()
@@ -315,14 +318,31 @@ class _UnionFind:
             self.parent[rb] = ra
 
 
-def plan(gm):
+def plan(gm, float16_rule=True):
     """The quantization points of gm: (list of stored tensor nodes to fake-quantize, {node: range group root},
-    list of conv nodes). Nothing is changed."""
+    list of conv nodes). Nothing is changed. float16_rule=False gives the earlier placement, without the float16 rule
+    and the side activations (checkpoints made with it load through upgrade_state_dict)."""
     g = _Graph(gm)
     uf = _UnionFind()
     internal = g.internal_nodes()
     anchors = [n for n in g.nodes if g.is_quantized_op(n, internal)]
-    stored = {g.fused_output(a) for a in anchors if not g.stores_own_output(a)}
+    stored = set()
+    for a in anchors:
+        if g.stores_own_output(a):
+            continue
+        out = g.fused_output(a)
+        if not float16_rule:
+            stored.add(out)
+            continue
+        # activations sharing the result with other readers: nncase fuses each into its own copy of the op
+        side = [u for u in g.nodes if u not in internal and (p := g.act_pattern(u)) is not None and p[0] is out]
+        stored |= {g.fused_output(u) for u in side}
+        side_nodes = set(side).union(*(g.act_pattern(u)[1] for u in side))
+        readers = [u for u in out.users if u not in side_nodes]
+        if (out is a and g.kind(a) in ("Conv2d", "Linear") and readers
+                and all(g.binary(u) in ("add", "mul") and g.is_quantized_op(u, internal) for u in readers)):
+            continue  # float16 on the K230: a plain conv / gemm output that only Add / Mul read
+        stored.add(out)
     for n in g.nodes:  # grid keeping ops: their output is the same quantized tensor (Concat also ties its inputs)
         if g.keeps_grid(n):
             ins = g.data_inputs(n) if g.kind(n) in CONCATS else g.data_inputs(n)[:1]
@@ -347,6 +367,8 @@ def make_quantizable(gm):
     Conv, an ActFakeQuant after every quantization point of plan(), one shared ActRange per range group. The
     quantizers start disabled."""
     points, groups, weighted = plan(gm)
+    index = {n: i for i, n in enumerate(points)}
+    gm.legacy_actq = [index.get(n) for n in plan(gm, float16_rule=False)[0]]  # see upgrade_state_dict
     for n in weighted:
         m = gm.get_submodule(n.target)
         _set_module(gm, n.target, QConv2d(m) if isinstance(m, nn.Conv2d) else QLinear(m))
@@ -369,6 +391,29 @@ def make_quantizable(gm):
     graph.lint()
     gm.recompile()
     return gm
+
+
+def upgrade_state_dict(gm, state_dict):
+    """A checkpoint of gm made with the earlier placement (plan(float16_rule=False): its actq_<i> numbered over more
+    points) -> the same ranges under the current actq_<i> names, the quantizers that no longer exist dropped. Other
+    state dicts are returned as they are."""
+    legacy = getattr(gm, "legacy_actq", None)
+    saved = {int(k.split(".")[0][5:]) for k in state_dict if k.startswith("actq_")}
+    current = sum(1 for name, _ in gm.named_children() if name.startswith("actq_"))
+    if legacy is None or len(saved) == current or len(saved) != len(legacy):
+        return state_dict
+    out = {}
+    for k, v in state_dict.items():
+        if not k.startswith("actq_"):
+            out[k] = v
+            continue
+        module, rest = k.split(".", 1)
+        j = legacy[int(module[5:])]
+        if j is not None:
+            out[f"actq_{j}.{rest}"] = v
+    print(f"checkpoint of the earlier quantizer placement: {len(saved)} activation quantizers -> {current} "
+          f"({sum(j is None for j in legacy)} on tensors the K230 keeps in float16 dropped)")
+    return out
 
 
 def describe_plan(gm):
