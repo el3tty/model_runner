@@ -135,6 +135,10 @@ class Task:
 
         set_state(model, weights=not args.float, acts=args.act_qdq and not args.float)
         print(describe(model))
+        unset = [n for n, m in model.named_modules() if isinstance(m, qat_generic.ExportQuant) and not m.params.seen]
+        if args.act_qdq and not args.float and unset:
+            raise SystemExit(f"{args.ckpt} has no ranges for {len(unset)} float16 tensors, and without their Q/DQ pairs "
+                             "nncase leaves those Add / Mul outside the KPU: export a newer checkpoint")
         example = None
         if args.example:
             example = np.fromfile(args.example, dtype="<f4").reshape(self.export_input_shape(args))

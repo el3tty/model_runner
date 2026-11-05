@@ -4,7 +4,7 @@
 Nothing here knows about a particular network: it works on any torch model made of convs, linears and LSTMs.
   * act_qparams, weight_qparams: the range / scale / zero-point rules copied from nncase (QuantUtility.GetQuantParam,
     FixupRange, GetWeightsRangesByChannel); uint8 (nncase UnsignedMode) only.
-  * ActRange, ActFakeQuant, WeightFakeQuant, QConv2d, QLinear, QLSTM: the fake-quant modules (several ActFakeQuant
+  * ActRange, ActFakeQuant, ExportQuant, WeightFakeQuant, QConv2d, QLinear, QLSTM: the fake-quant modules (several ActFakeQuant
     can share one ActRange).
   * calibrate: the activation ranges, chosen like nncase's PTQ (KLD or plain min/max); they stay fixed in training.
   * set_state, describe, dump_ranges, bake_weights, export_onnx.
@@ -79,6 +79,15 @@ class ActFakeQuant(nn.Module):
             # constants, not traced ops
             return torch.fake_quantize_per_tensor_affine(x, float(scale), int(zp), QMIN, QMAX)
         return torch.fake_quantize_per_tensor_affine(x, scale, zp, QMIN, QMAX)
+
+
+class ExportQuant(ActFakeQuant):
+    """A tensor the K230 keeps in float16 but nncase must see quantized: no rounding in training or evaluation, a Q/DQ
+    pair in the ONNX export. In a compile with Q/DQ ranges, nncase leaves an Add / Mul with an input without a range as
+    a float32 Binary outside the KPU; with the pair it runs on the KPU and still reads that input as float16."""
+
+    def forward(self, x):
+        return super().forward(x) if torch.onnx.is_in_onnx_export() else x
 
 
 class WeightFakeQuant(nn.Module):
@@ -207,10 +216,12 @@ def set_state(model, weights, acts):
 
 
 def describe(model):
-    qs = [m for m in model.modules() if isinstance(m, ActFakeQuant)]
+    qs = [m for m in model.modules() if isinstance(m, ActFakeQuant) and not isinstance(m, ExportQuant)]
     groups = {id(q.params) for q in qs}
     nconv = sum(isinstance(m, WeightFakeQuant) for m in model.modules())
-    return f"{nconv} weight quantizers, {len(qs)} activation quantizers in {len(groups)} range groups"
+    exported = sum(isinstance(m, ExportQuant) for m in model.modules())
+    return (f"{nconv} weight quantizers, {len(qs)} activation quantizers in {len(groups)} range groups"
+            + (f", {exported} more only in the export" if exported else ""))
 
 
 # ----------------------------------------------------------------------------------------------------------------------

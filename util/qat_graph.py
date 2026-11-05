@@ -13,7 +13,8 @@ The quantizers go where the K230 compile path quantizes, by graph rules, so a ne
   * a stored tensor gets an activation fake-quant if a quantized op reads it, directly or through ops that keep
     the quantization grid (MaxPool, nearest Resize, Concat, Slice, Reshape, Transpose, Flatten, Squeeze, Unsqueeze);
     except a Conv / Gemm output without an activation that only Add / Mul read: nncase keeps it in float16 (checked
-    in its quantized IR: e.g. a MobileNetV3 project conv into the residual Add);
+    in its quantized IR: e.g. a MobileNetV3 project conv into the residual Add). That tensor gets an ExportQuant:
+    no rounding here, but a Q/DQ pair in the export, without which nncase leaves the Add / Mul outside the KPU;
   * the inputs of a Concat share one range (nncase unites concat ranges), so do the tensors a grid keeping op
     connects; the model input is not quantized (it is uint8 already).
 load() also turns Constant weights into initializers and makes a constant batch size of 1 dynamic; load_scheme_ranges()
@@ -33,7 +34,7 @@ from onnx2torch import convert
 from onnx2torch.node_converters.registry import add_converter
 from onnx2torch.utils.common import OnnxMapping, OperationConverterResult
 
-from util.qat_generic import ActFakeQuant, QConv2d, QLinear, QLSTM
+from util.qat_generic import ActFakeQuant, ExportQuant, QConv2d, QLinear, QLSTM
 
 # node kinds: module class names (onnx2torch's or torch.nn's), function / method names of a traced torch model
 ACTIVATIONS = ("Relu", "LeakyRelu", "Clip", "Sigmoid", "HardSigmoid", "Hardsigmoid", "Hardswish", "OnnxHardSigmoid",
@@ -357,6 +358,14 @@ def plan(gm, float16_rule=True):
     return points, {n: uf.find(n) for n in points}, weighted
 
 
+def float16_points(gm):
+    """[(plain conv / gemm output of plan()'s float16 rule, the Add / Mul nodes reading it)], in graph order."""
+    g = _Graph(gm)
+    kept = set(plan(gm)[0])
+    return [(n, [u for u in n.users if g.binary(u) in ("add", "mul")])
+            for n in plan(gm, float16_rule=False)[0] if n not in kept]
+
+
 def _set_module(gm, target, module):
     parent, _, name = target.rpartition(".")
     setattr(gm.get_submodule(parent) if parent else gm, name, module)
@@ -364,9 +373,10 @@ def _set_module(gm, target, module):
 
 def make_quantizable(gm):
     """Insert the fake quantizers into the onnx2torch GraphModule gm (in place) and return it: QConv2d for every
-    Conv, an ActFakeQuant after every quantization point of plan(), one shared ActRange per range group. The
-    quantizers start disabled."""
+    Conv, an ActFakeQuant after every quantization point of plan(), one shared ActRange per range group, an ExportQuant
+    in front of the Add / Mul readers of float16_points(). The quantizers start disabled."""
     points, groups, weighted = plan(gm)
+    float16 = float16_points(gm)
     index = {n: i for i, n in enumerate(points)}
     gm.legacy_actq = [index.get(n) for n in plan(gm, float16_rule=False)[0]]  # see upgrade_state_dict
     for n in weighted:
@@ -388,6 +398,13 @@ def make_quantizable(gm):
             qn = graph.call_module(name, (n,))
         for u in users:
             u.replace_input_with(n, qn)
+    for i, (n, readers) in enumerate(float16):
+        name = f"exportq_{i}"
+        gm.add_module(name, ExportQuant())
+        with graph.inserting_after(n):
+            qn = graph.call_module(name, (n,))
+        for u in readers:
+            u.replace_input_with(n, qn)
     graph.lint()
     gm.recompile()
     return gm
@@ -395,24 +412,31 @@ def make_quantizable(gm):
 
 def upgrade_state_dict(gm, state_dict):
     """A checkpoint of gm made with the earlier placement (plan(float16_rule=False): its actq_<i> numbered over more
-    points) -> the same ranges under the current actq_<i> names, the quantizers that no longer exist dropped. Other
-    state dicts are returned as they are."""
+    points) -> the same ranges under the current actq_<i> and exportq_<i> names. A checkpoint from before the
+    ExportQuants has no ranges for them: they stay unset (seen = 0), and Task.export refuses to use them. Other state
+    dicts are returned as they are."""
     legacy = getattr(gm, "legacy_actq", None)
     saved = {int(k.split(".")[0][5:]) for k in state_dict if k.startswith("actq_")}
     current = sum(1 for name, _ in gm.named_children() if name.startswith("actq_"))
-    if legacy is None or len(saved) == current or len(saved) != len(legacy):
+    exported = sum(1 for name, _ in gm.named_children() if name.startswith("exportq_"))
+    if legacy is None or not exported or any(k.startswith("exportq_") for k in state_dict):
         return state_dict
-    out = {}
+    if len(saved) == current:
+        print(f"checkpoint without the ranges of the {exported} float16 tensors: it evaluates, but cannot be exported "
+              "with --act-qdq")
+        return {**state_dict, **{k: v for k, v in gm.state_dict().items() if k.startswith("exportq_")}}
+    if len(saved) != len(legacy):
+        return state_dict
+    out, float16 = {}, {i: n for n, i in enumerate(i for i, j in enumerate(legacy) if j is None)}
     for k, v in state_dict.items():
         if not k.startswith("actq_"):
             out[k] = v
             continue
         module, rest = k.split(".", 1)
-        j = legacy[int(module[5:])]
-        if j is not None:
-            out[f"actq_{j}.{rest}"] = v
+        i = int(module[5:])
+        out[f"actq_{legacy[i]}.{rest}" if legacy[i] is not None else f"exportq_{float16[i]}.{rest}"] = v
     print(f"checkpoint of the earlier quantizer placement: {len(saved)} activation quantizers -> {current} "
-          f"({sum(j is None for j in legacy)} on tensors the K230 keeps in float16 dropped)")
+          f"(+ {exported} on tensors the K230 keeps in float16, only in the export)")
     return out
 
 
@@ -424,6 +448,7 @@ def describe_plan(gm):
     for n in points:
         gid = ids.setdefault(groups[n], len(ids))
         lines.append(f"  g{gid:3d}  {n.name}  -> {', '.join(u.name for u in n.users)}")
+    lines += [f"  export  {n.name}  -> {', '.join(u.name for u in readers)}" for n, readers in float16_points(gm)]
     return "\n".join(lines)
 
 

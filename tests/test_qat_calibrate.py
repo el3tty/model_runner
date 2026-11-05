@@ -25,16 +25,16 @@ from util.qat_generic import DST_BINS, SRC_BINS, ActFakeQuant, calibrate, kld_ra
 pytestmark = [pytest.mark.filterwarnings("ignore::UserWarning"),  # onnx2torch's notes on Resize modes
               pytest.mark.filterwarnings("ignore::DeprecationWarning")]
 
-# case: the tensors of each range group, in quantizer order
+# case: the tensors of each range group, in quantizer order (the float16 tensors of the export last)
 GROUPS = {
     "conv_relu_conv": [["r1"]],
     "silu_maxpool": [["a1"]],
     "concat_ties_ranges": [["r1", "r2"]],
     "resize_nearest_concat": [["r1", "r2"]],
-    "residual_add": [["r1"], ["r2"]],
-    "add_chain": [["r0"], ["a1"], ["a2"]],
+    "residual_add": [["r1"], ["r2"], ["c2"]],
+    "add_chain": [["r0"], ["a1"], ["a2"], ["c1"], ["c2"]],
     "plain_conv_to_add_and_conv": [["r0"], ["c1"], ["a", "c2"]],
-    "activation_beside_another_reader": [["r1"], ["a"]],
+    "activation_beside_another_reader": [["r1"], ["a"], ["c1"]],
     "hardswish_mul_div": [["h"]],
     "squeeze_excitation": [["r1"], ["p"], ["r2"], ["hs"], ["m"]],
     "pool_flatten_gemm": [["r1"], ["p"]],
@@ -118,8 +118,8 @@ def test_state_after_calibration(tmp_path, capsys):
     calibrate(model, data, "noclip")
     fake = [m for m in model.modules() if isinstance(m, (ActFakeQuant, qat_generic.WeightFakeQuant))]
     assert all(m.enabled for m in fake) and not any(m._forward_hooks for m in fake)
-    assert [int(r.seen) for r in range_groups(model)] == [3, 3]
-    assert "calibrated 2 range groups on 3 images (noclip)" in capsys.readouterr().out
+    assert [int(r.seen) for r in range_groups(model)] == [3, 3, 3]
+    assert "calibrated 3 range groups on 3 images (noclip)" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("method", ["noclip", "kld"])

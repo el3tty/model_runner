@@ -11,6 +11,8 @@ form and compared with the expected text:
 x is the model input, y the output, v1, v2, ... the other tensors in node order. Every range group gets its own range
 before the export, so equal scales mean a shared group.
 """
+import types
+
 import numpy as np
 import onnx
 import onnx.parser
@@ -19,7 +21,7 @@ import pytest
 pytest.importorskip("torch")  # requirements-qat.txt
 pytest.importorskip("onnx2torch")
 
-from util import qat_generic, qat_graph
+from util import qat_generic, qat_graph, qat_train
 
 pytestmark = [pytest.mark.filterwarnings("ignore::UserWarning"),  # onnx2torch's notes on Resize modes
               pytest.mark.filterwarnings("ignore::DeprecationWarning")]  # the legacy TorchScript exporter
@@ -160,7 +162,8 @@ v8 = Concat(v3, v7)
 y = Conv(v8, #, #)"""),
 
     # Add of two tensors is a quantized op; its fused Relu output is read by the next conv. The conv output without
-    # an activation that only the Add reads stays float (float16 on the K230: GNNEStore f32 -> GNNELoad f16)
+    # an activation that only the Add reads is not rounded (float16 on the K230: GNNEStore f32 -> GNNELoad f16), but it
+    # has a Q/DQ pair in the export: without it, nncase leaves the Add outside the KPU
     "residual_add": ("""
 g (float[1,4,8,8] x, float[4,4,3,3] w1, float[4] b1, float[4,4,3,3] w2, float[4] b2, float[4,4,1,1] w3, float[4] b3)
   => (float[1,4,8,8] y) {
@@ -175,13 +178,14 @@ v1 = Conv(x, #, #)
 v2 = Relu(v1)
 v3 = Q0(v2)
 v4 = Conv(v3, #, #)
-v5 = Add(v3, v4)
-v6 = Relu(v5)
-v7 = Q1(v6)
-y = Conv(v7, #, #)"""),
+v5 = Q1(v4)
+v6 = Add(v3, v5)
+v7 = Relu(v6)
+v8 = Q2(v7)
+y = Conv(v8, #, #)"""),
 
-    # residual blocks in a row: both plain conv outputs stay float, the Add output read by a conv and an Add is
-    # quantized (as nncase does)
+    # residual blocks in a row: both plain conv outputs are only quantized in the export, the Add output read by a conv
+    # and an Add is quantized (as nncase does)
     "add_chain": ("""
 g (float[1,4,8,8] x, float[4,4,3,3] w0, float[4] b0, float[4,4,3,3] w1, float[4] b1, float[4,4,3,3] w2, float[4] b2,
    float[4,4,1,1] w3, float[4] b3) => (float[1,4,8,8] y) {
@@ -197,12 +201,14 @@ v1 = Conv(x, #, #)
 v2 = Relu(v1)
 v3 = Q0(v2)
 v4 = Conv(v3, #, #)
-v5 = Add(v3, v4)
-v6 = Q1(v5)
-v7 = Conv(v6, #, #)
-v8 = Add(v6, v7)
-v9 = Q2(v8)
-y = Conv(v9, #, #)"""),
+v5 = Q1(v4)
+v6 = Add(v3, v5)
+v7 = Q2(v6)
+v8 = Conv(v7, #, #)
+v9 = Q3(v8)
+v10 = Add(v7, v9)
+v11 = Q4(v10)
+y = Conv(v11, #, #)"""),
 
     # a plain conv output that a conv reads too is quantized, and the Add reads the quantized tensor
     "plain_conv_to_add_and_conv": ("""
@@ -229,7 +235,8 @@ v10 = Concat(v7, v9)
 y = Conv(v10, #, #)"""),
 
     # Relu shares the conv output with an Add: nncase duplicates the conv, one copy with the Relu fused (stored
-    # uint8: quantized), one plain copy for the Add (float16: not quantized)
+    # uint8: quantized), one plain copy for the Add (float16: its pair is only in the export, and only on the Add's
+    # edge, so the Relu still reads the conv directly and fuses into it)
     "activation_beside_another_reader": ("""
 g (float[1,4,8,8] x, float[4,4,3,3] w1, float[4] b1, float[4,4,1,1] w2, float[4] b2) => (float[1,4,8,8] y) {
   c1 = Conv <pads=[1,1,1,1]> (x, w1, b1)
@@ -238,11 +245,12 @@ g (float[1,4,8,8] x, float[4,4,3,3] w1, float[4] b1, float[4,4,1,1] w2, float[4]
   y = Conv (a, w2, b2)
 }""", """
 v1 = Conv(x, #, #)
-v2 = Relu(v1)
-v3 = Q0(v2)
-v4 = Add(v1, v3)
-v5 = Q1(v4)
-y = Conv(v5, #, #)"""),
+v2 = Q0(v1)
+v3 = Relu(v1)
+v4 = Q1(v3)
+v5 = Add(v2, v4)
+v6 = Q2(v5)
+y = Conv(v6, #, #)"""),
 
     # HardSwish spelled out as (x * Clip(x + 3, 0, 6)) / 6 is one activation: no quantizer inside it
     "hardswish_mul_div": ("""
@@ -374,19 +382,55 @@ def test_weights_are_quantized_per_channel(tmp_path):
 
 def test_checkpoint_of_the_earlier_placement(tmp_path):
     """A state dict numbered over the earlier points (the plain conv output into the Add had a quantizer) loads into
-    the current model: each range lands on the same tensor, the dropped quantizer's range is discarded."""
+    the current model: each range lands on the same tensor, the plain conv output's on its ExportQuant."""
     import torch
 
     src = tmp_path / "in.onnx"
     build(CASES["residual_add"][0], src)
     gm = qat_graph.make_quantizable(qat_graph.load(str(src)))
     assert gm.legacy_actq == [0, None, 1]  # earlier: Relu output, plain conv output, Add+Relu output
-    state = {k: v for k, v in gm.state_dict().items() if not k.startswith("actq_")}
+    state = {k: v for k, v in gm.state_dict().items() if not k.startswith(("actq_", "exportq_"))}
     for i in range(3):
         state[f"actq_{i}.params.min_val"] = torch.tensor(-1.0)
         state[f"actq_{i}.params.max_val"] = torch.tensor(float(i + 1))
         state[f"actq_{i}.params.seen"] = torch.tensor(1)
     gm.load_state_dict(qat_graph.upgrade_state_dict(gm, state))
     assert [float(gm.get_submodule(f"actq_{j}").params.max_val) for j in range(2)] == [1.0, 3.0]
+    assert float(gm.exportq_0.params.max_val) == 2.0
     current = gm.state_dict()
     assert qat_graph.upgrade_state_dict(gm, current) is current  # a current checkpoint is left alone
+
+
+def test_checkpoint_without_the_export_ranges(tmp_path, capsys):
+    """A checkpoint with the current actq_<i> but no exportq_<i> loads and evaluates; the export refuses it, because
+    its Add would leave the KPU."""
+    src = tmp_path / "in.onnx"
+    build(CASES["residual_add"][0], src)
+    gm = qat_graph.make_quantizable(qat_graph.load(str(src)))
+    state = {k: v for k, v in gm.state_dict().items() if not k.startswith("exportq_")}
+    gm.load_state_dict(qat_graph.upgrade_state_dict(gm, state))
+    assert "cannot be exported" in capsys.readouterr().out
+    args = types.SimpleNamespace(float=False, act_qdq=True, ckpt="old.pth", example=None)
+    with pytest.raises(SystemExit, match="old.pth has no ranges for 1 float16 tensors"):
+        qat_train.Task().export(gm, {}, args)
+
+
+def test_a_float16_tensor_is_not_rounded():
+    """An enabled ExportQuant changes nothing outside the export; an ActFakeQuant with the same range clips."""
+    import torch
+
+    x = torch.tensor([0.123, 5.0])
+    q, a = qat_generic.ExportQuant(), qat_generic.ActFakeQuant()
+    for m in (q, a):
+        m.params.max_val.fill_(1.0)
+        m.enabled = True
+    assert q(x) is x
+    assert float(a(x)[1]) == 1.0
+
+
+def test_describe_counts_the_export_only_quantizers(tmp_path):
+    src = tmp_path / "in.onnx"
+    build(CASES["residual_add"][0], src)
+    gm = qat_graph.make_quantizable(qat_graph.load(str(src)))
+    assert qat_generic.describe(gm).endswith("2 activation quantizers in 2 range groups, 1 more only in the export")
+    assert "  export  conv_1  -> add" in qat_graph.describe_plan(qat_graph.load(str(src)))

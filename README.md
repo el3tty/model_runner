@@ -144,14 +144,15 @@ quantizes, by graph rules, on a `torch.fx` graph (YOLOX: the float model traced;
   keep the quantization grid (MaxPool, nearest Resize / Upsample, Concat, slicing, Reshape, Transpose, ...); the
   inputs of a Concat share one range (nncase unites concat ranges); the model input is not quantized. Except a
   Conv / Gemm output without an activation that only Add / Mul read: the K230 keeps it in float16 (nncase's
-  quantized IR stores it f32 and loads it f16), so it stays float here too (PP-OCR: the 7 MobileNetV3 project convs
-  into the residual Adds; YOLOX: none);
+  quantized IR stores it f32 and loads it f16), so training does not round it (PP-OCR: the 7 MobileNetV3 project convs
+  into the residual Adds; YOLOX: none). The export still gives it a Q/DQ pair (`ExportQuant`): nncase needs a range on
+  both inputs of an Add / Mul to run it on the KPU, without one it stays a float32 `Binary` outside the KPU;
 * the LSTM (`QLSTM`): the KPU runs it with uint8 x, W, R (per row) and hidden state, and an fp16 cell state; the
   fake-quant version quantizes the hidden state at every time step (the tensor stored as Y and fed back).
 
 For YOLOX these rules give exactly the placement of the former hand-written code (111 activation quantizers in 99
 range groups, each at the same tensor). Checkpoints made before the float16 rule (PP-OCR: 80 activation quantizers,
-now 73) load with their ranges moved to the remaining quantizers. Then:
+now 73 and 7 only in the export) load with each range on the same tensor. Then:
 
 1. the activation ranges: calibrated like nncase's PTQ (`--calib kld`, nncase's default KL divergence of 8192-bin
    histograms, or `noclip` = min / max), on the float network and the input as the K230 sees it; that gives nncase's
@@ -507,8 +508,9 @@ character set with the PaddleOCR model's metadata and is skipped without `weight
 patterns, MaxPool, Concat, nearest Resize, residual Adds, an activation beside another reader, squeeze-excitation,
 pooling + Gemm, LSTM), runs `qat_graph.load` and `make_quantizable`, exports them with `--act-qdq` and compares the
 exported graph, printed in a compact text form, with where the quantizers and shared ranges belong (the float16
-cases as nncase's quantized IR stores them); also the per-channel weight grid and the loading of a checkpoint of the
-earlier placement. Needs torch, onnx and onnx2torch.
+cases as nncase's quantized IR stores them, with the Q/DQ pairs of the export); also the per-channel weight grid, the
+loading of checkpoints of earlier placements and that a float16 tensor is not rounded outside the export. Needs torch,
+onnx and onnx2torch.
 `tests/test_qat_calibrate.py` runs `qat_generic.calibrate` on the same models and compares every range group, for
 noclip and KLD, with the float tensors from onnxruntime; also the state after calibration and degenerate tensors.
 `kld_range` is compared with thresholds taken from nncase's own `Nncase.Quantization.dll`.
