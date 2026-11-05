@@ -158,11 +158,11 @@ def test_split_qkv_heads_and_scale():
 def test_empty_clip_max_is_dropped():
     text = """
     g (float[1,4] x) => (float[1,4] y) {
-        y = Clip(x, low, )
+        y = Clip(x, low)
     }
     """
     m = model(text, low=np.float32(0.25))
-    assert list(m.graph.node[0].input)[2:] == [""]
+    m.graph.node[0].input.append("")  # the text parser drops an empty last input
     out, fired = rw.rewrite(m, log=lambda s: None)
     assert fired == {"drop_empty_clip_max": 1} and len(out.graph.node[0].input) == 2
 
