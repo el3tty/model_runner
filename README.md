@@ -506,10 +506,15 @@ is applied until it no longer matches, and the graph is compared with the origin
 | `cancel_transposes`, `fold_reshapes` | NCHW / NHWC pairs, Reshape of a Reshape | gone |
 | `fold_conv_bias`, `fold_conv_scale`, `fold_conv_reshape_scale` | Add / Mul with a constant after a Conv | in the Conv |
 | `drop_expand` | Expand read as a divisor | gone, Div broadcasts |
+| `drop_empty_clip_max` | `Clip(x, min, "")` | `Clip(x, min)`, which `onnx2torch` can load |
 
 The reason for most of them: nncase cannot put a Reshape inside a layer group, so every layout change is a DDR round
 trip. The rules are narrow on purpose: they match only the ops, layouts and shapes seen in YOLO26 and Lite-Mono (they do
 nothing to PP-OCR and YOLOX). Add a pattern for a new model after looking at its graph, rather than loosening a rule.
+
+Rewrite the float model, before QAT: the rules keep the float function, so the weights carry over, and the quantizers
+then sit on the tensors the K230 stores. `qat_graph.load()` takes the rewritten ONNX. `onnx_opt.py` refuses a model with
+Q/DQ nodes: the patterns do not match across a pair, and a fold would remove a tensor that has a range.
 
 ## One image
 

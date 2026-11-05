@@ -600,6 +600,21 @@ def generate_fold_conv_reshape_scale(g, m):
     return Replace([conv, r, m["node"]], [new, helper.make_node("Reshape", list(r.input), [m["node"].output[0]])])
 
 
+# drop_empty_clip_max: Clip(x, min, "") is Clip(x, min), the export of clamp_min. onnx2torch cannot load the empty input,
+# so qat_graph.load() needs this form.
+
+def match_drop_empty_clip_max(g, node):
+    if node.op_type != "Clip" or len(node.input) != 3 or node.input[2] != "":
+        return None
+    return {"node": node}
+
+
+def generate_drop_empty_clip_max(g, m):
+    c = copy.deepcopy(m["node"])
+    del c.input[2]
+    return Replace([m["node"]], [c])
+
+
 # drop_expand: an Expand read only as the divisor of a Div on a tensor of the expanded shape, which broadcasts by itself
 # (the last step of F.normalize).
 
@@ -673,6 +688,7 @@ RULES = [
     Rule("tokens_to_nhwc", match_tokens_to_nhwc, generate_tokens_to_nhwc),
     Rule("heads_to_tokens", match_heads_to_tokens, generate_heads_to_tokens),
     Rule("drop_expand", match_drop_expand, generate_alias),
+    Rule("drop_empty_clip_max", match_drop_empty_clip_max, generate_drop_empty_clip_max),
     Rule("fold_reshapes", match_fold_reshapes, generate_fold_reshapes),
     Rule("cancel_transposes", match_cancel_transposes, generate_alias),
     Rule("merge_add", match_merge_add, generate_merge_add),
@@ -733,6 +749,10 @@ def rewrite(model, rules=None, tolerance=1e-3, log=print, limit=5000):
     still fires. Compared with the original on a random input after every rule that fired. Returns the model and
     {rule name: times applied}."""
     rules = RULES if rules is None else rules
+    quantized = sum(n.op_type in ("QuantizeLinear", "DequantizeLinear") for n in model.graph.node)
+    if quantized:
+        raise ValueError(f"the model has {quantized} Q/DQ nodes: rewrite the float model, before QAT or quantization. "
+                         "The patterns do not match across Q/DQ pairs, and a fold would remove a tensor with a range")
     feeds = random_feeds(model)
     want = run_model(model, feeds)
     scale = max(float(np.abs(w).max()) for w in want) or 1.0

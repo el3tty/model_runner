@@ -155,6 +155,40 @@ def test_split_qkv_heads_and_scale():
     assert ops["Conv"] == 3 and ops["Split"] == 0 and ops["Mul"] == 0
 
 
+def test_empty_clip_max_is_dropped():
+    text = """
+    g (float[1,4] x) => (float[1,4] y) {
+        y = Clip(x, low, )
+    }
+    """
+    m = model(text, low=np.float32(0.25))
+    assert list(m.graph.node[0].input)[2:] == [""]
+    out, fired = rw.rewrite(m, log=lambda s: None)
+    assert fired == {"drop_empty_clip_max": 1} and len(out.graph.node[0].input) == 2
+
+
+def test_clip_with_a_max_stays():
+    text = """
+    g (float[1,4] x) => (float[1,4] y) {
+        y = Clip(x, low, high)
+    }
+    """
+    _, fired = rewrite(model(text, low=np.float32(0), high=np.float32(1)))
+    assert not fired
+
+
+def test_a_quantized_model_is_refused():
+    text = """
+    g (float[1,4] x) => (float[1,4] y) {
+        q = QuantizeLinear(x, scale, zero)
+        y = DequantizeLinear(q, scale, zero)
+    }
+    """
+    m = model(text, scale=np.float32(0.1), zero=np.uint8(128))
+    with pytest.raises(ValueError, match="2 Q/DQ nodes"):
+        rw.rewrite(m, log=lambda s: None)
+
+
 def test_lint_reports_what_costs_time():
     text = """
     g (float[1,4,6,8] x) => (float[1,4,8,10] y) {
