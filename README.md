@@ -150,19 +150,46 @@ quantizes, by graph rules, on a `torch.fx` graph (YOLOX: the float model traced;
 * the LSTM (`QLSTM`): the KPU runs it with uint8 x, W, R (per row) and hidden state, and an fp16 cell state; the
   fake-quant version quantizes the hidden state at every time step (the tensor stored as Y and fed back).
 
-**Where the Q/DQ pairs go.** A `--act-qdq` export has a QuantizeLinear -> DequantizeLinear pair on an activation in
-exactly three cases (PP-OCR: 71 + 2 + 7 = 80 pairs):
+**Where the Q/DQ pairs go, in any graph.** `util/qat_graph.py` sorts the ops of a model into four kinds:
 
-1. a tensor the K230 stores as uint8 and a quantized op reads, directly or through ops that keep the grid: the output of
-   a quantized op, after its fused activation. Rounded in training too;
-2. the hidden state output of an LSTM. Rounded in training too, at every time step;
-3. a Conv / Gemm output without an activation that goes into an Add / Mul and is not stored as uint8 for another reader:
-   the pair goes on the edge into the Add / Mul only. Not rounded, in training or on the K230 (float16): it only gives
-   nncase the range without which that Add / Mul leaves the KPU.
+| Kind | Ops |
+|---|---|
+| quantized op | Conv (depthwise and grouped too), Gemm, LSTM, AveragePool, GlobalAveragePool, Add / Mul of two tensors |
+| fused activation | Relu, LeakyRelu, Clip, Sigmoid, HardSigmoid, HardSwish, SiLU, also spelled out as several ops |
+| grid keeping op | MaxPool, nearest Resize, Concat, Slice, Reshape, Transpose, Flatten, Squeeze, Unsqueeze |
+| anything else | e.g. Softmax, Sub, Div, Add / Mul with a constant, a Resize that interpolates |
 
-There is no pair on the model input (uint8 already), between an op and its fused activation, after an op that keeps the
-grid (it shares the range of its input), on a tensor no quantized op reads (e.g. the model output) or on the weights
-(baked onto their grid, unless `--weight-qdq`).
+Then, for the output of every quantized op:
+
+1. Follow it through the activations that are its only readers: that tensor is what the K230 stores.
+2. A quantized op reads it, directly or through grid keeping ops: it gets a pair, right after the op or its activation.
+   Nothing reads it that way: no pair.
+3. Except when it is a Conv / Gemm output without an activation and every reader is an Add / Mul of two tensors: the K230
+   keeps it in float16. The pair goes on the edges into the Add / Mul, only in the export (`ExportQuant`): training does
+   not round it and neither does the K230, but without it the Add / Mul leaves the KPU.
+4. An activation beside other readers gets its own copy of the op: its output follows rule 2, and the raw output rules 2
+   and 3 for the other readers.
+5. An LSTM stores its hidden state itself: one pair on its output, rounded at every time step in training.
+
+The pairs of a grid keeping op's input and output are one tensor with one range, so the pair goes in front of the op, and
+all the inputs of a Concat share a range. By the reader of a tensor:
+
+| Producer | Reader | Result |
+|---|---|---|
+| Conv -> Relu | Conv, depthwise Conv, Gemm | `Conv -> Relu -> QDQ -> Conv` |
+| Conv, no activation | Conv, depthwise Conv, Gemm | `Conv -> QDQ -> Conv` |
+| Conv, no activation | Add / Mul only | `Conv -> QDQ (export only) -> Add` |
+| Conv, no activation | Add / Mul and a Conv | `Conv -> QDQ`, both read the quantized tensor |
+| Conv -> Relu | Add / Mul | `Conv -> Relu -> QDQ -> Add` |
+| Add -> Relu, or Add | Conv, Add / Mul | `Add -> Relu -> QDQ -> Conv` |
+| GlobalAveragePool | Conv, Gemm | `Pool -> QDQ -> Conv` |
+| Conv -> Relu | MaxPool, Reshape, ... -> Conv | `Conv -> Relu -> QDQ -> MaxPool -> Conv` |
+| any quantized op | nothing quantized (e.g. the model output) | no pair |
+
+There is never a pair on the model input (uint8 already), between an op and its fused activation, or on Conv / Gemm
+weights (baked onto their grid, unless `--weight-qdq`). The output of an op of the last kind gets no pair either, even if
+a Conv reads it: the rules only cover the outputs of quantized ops. For PP-OCR these rules give 71 + 2 LSTM + 7 export
+only = 80 pairs.
 
 For YOLOX these rules give exactly the placement of the former hand-written code (111 activation quantizers in 99
 range groups, each at the same tensor). Checkpoints made before the float16 rule (PP-OCR: 80 activation quantizers,
