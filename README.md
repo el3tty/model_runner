@@ -3,6 +3,15 @@
 Scripts to run YOLO detectors as ONNX (onnxruntime, PC) and as K230 kmodels (board or nncase simulator), and to
 measure their COCO val2017 AP the same way for both.
 
+PC times and memory limits below were measured on this PC (the "test PC"); times on the board are K230 times:
+
+| Part | Test PC |
+|---|---|
+| CPU | AMD Ryzen 9 3950X, 16 cores / 32 threads |
+| GPU | NVIDIA GeForce GTX 1060 6 GB |
+| RAM | 64 GB |
+| Storage | 2 TB NVMe SSD |
+
 Placeholders used below:
 
 | Placeholder | Meaning |
@@ -32,7 +41,7 @@ Placeholders used below:
   `run-model.py` and `coco_run.py` need `nncaseruntime` from the nncase build: a link to its `nncaseruntime` folder
   in this folder is enough, e.g. to `<nncase>/build-rel/install/nncaseruntime`.
 * nncase compiler: build the CLI in Release (calibration runs the model in nncase's own evaluator, about 5 s per
-  image and pass even in Release):
+  image and pass on the test PC, even in Release):
 
   ```
   cd <nncase>
@@ -87,7 +96,7 @@ All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yol
    python -c "import os, random, shutil, sys; s, d = sys.argv[1:]; os.makedirs(d, exist_ok=True); [shutil.copy(os.path.join(s, f), d) for f in random.Random(0).sample(sorted(os.listdir(s)), 300)]" <COCO>/train2017 calib300
    ```
 
-3. Compile (PTQ, KLD calibration, uint8 input). Takes about 1 hour, nearly all of it calibration:
+3. Compile (PTQ, KLD calibration, uint8 input). Takes about 1 hour on the test PC, nearly all of it calibration:
 
    ```
    compile
@@ -285,8 +294,8 @@ The calibrated model scores what the board does (PTQ: 0.853 words / CER 0.029, t
 0.0115 on the K230 simulator (bit-exact with the board), against 0.855 / 0.029 for the PTQ kmodel. The input is
 mapped like the K230's pre-process, `(x - 128) / 127.5` (nncase's integer zero point; PaddleOCR uses 127.5).
 
-Training speed: the LSTMs run step by step in Python, about 125 lines/s on a GTX 1060 at `-b 128` (`-b 256` does not
-fit in 6 GB); the default 20 x 1000 x 128 lines took 5.6 hours there (the best epoch was the third: `--epochs 5`
+Training speed: the LSTMs run step by step in Python, about 125 lines/s on the test PC at `-b 128` (`-b 256` does not
+fit in its 6 GB); the default 20 x 1000 x 128 lines took 5.6 hours there (the best epoch was the third: `--epochs 5`
 would have done). Fonts for the training lines:
 `--fonts <dir>` (every `.ttf` / `.otf` in it), else the Windows fonts `data/ocr-synth` was made with, else the DejaVu
 / Liberation fonts of a Linux system (`apt-get install fonts-dejavu-core fonts-liberation`).
@@ -334,8 +343,9 @@ input (the k230 branch of `<nncase>`); an older one fails on the LSTM with "Inva
 
 #### QAT training on RunPod
 
-YOLOX training is CPU-bound (data augmentation): about 5 hours on an RTX 4090 pod with 10 vCPUs at `-b 16`. PP-OCR
-renders its training lines on the pod (no data set to upload) and fits a local GPU as well. Use a PyTorch template
+YOLOX training is CPU-bound (data augmentation): about 5 hours on a rented RTX 4090 pod with 10 vCPUs at `-b 16`, not
+on the test PC. PP-OCR renders its training lines on the pod (no data set to upload) and fits the test PC's GPU as well.
+Use a PyTorch template
 with a network volume (`/workspace` survives pod restarts; everything else does not) and "SSH over exposed TCP": the
 `ssh.runpod.io` proxy gives only an interactive shell, so `scp` and `rsync` fail through it. Placeholders:
 `<pod-ip>` and `<port>` from the pod's Connect page, `<key>` the SSH key added to RunPod.
