@@ -19,6 +19,9 @@ import io
 import os
 import sys
 import time
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))  # util/ and nncaseruntime of the repository
 
 import numpy as np
 

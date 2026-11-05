@@ -1,7 +1,8 @@
 # model_runner: Python scripts for preparing and running models on the K230
 
 Scripts to run YOLO detectors as ONNX (onnxruntime, PC) and as K230 kmodels (board or nncase simulator), and to
-measure their COCO val2017 AP the same way for both.
+measure their COCO val2017 AP the same way for both. `convert/` holds the exports and the ONNX rewriter, `eval/` the
+measurements; run everything from this folder.
 
 PC times and memory limits below were measured on this PC (the "test PC"); times on the board are K230 times:
 
@@ -38,7 +39,7 @@ Placeholders used below:
   ```
 
   YOLOX QAT also needs the `yolox` package, from its repository (see [the RunPod commands](#qat-training-on-runpod)).
-  `run-model.py` and `coco_run.py` need `nncaseruntime` from the nncase build: a link to its `nncaseruntime` folder
+  `run-model.py` and `eval/coco_run.py` need `nncaseruntime` from the nncase build: a link to its `nncaseruntime` folder
   in this folder is enough, e.g. to `<nncase>/build-rel/install/nncaseruntime`.
 * nncase compiler: build the CLI in Release (calibration runs the model in nncase's own evaluator, about 5 s per
   image and pass on the test PC, even in Release):
@@ -52,11 +53,11 @@ Placeholders used below:
   per line, as in the compile blocks below): `Nncase.Cli.exe @args.txt`. Relative paths in it are relative to the
   current directory (the blocks below assume this folder); `${here}` stands for the response file's folder, e.g.
   `${here}/../kmodel/model.kmodel`.
-* Board: Python 3 with numpy and nncaseruntime. Copy `coco_run.py`, `run-model.py` and `util/`. The board clock may
-  be wrong, so copy with `tar xmf` (does not restore modification times):
+* Board: Python 3 with numpy and nncaseruntime. Copy `eval/coco_run.py`, `eval/litemono_run.py`, `run-model.py` and
+  `util/` into one folder. The board clock may be wrong, so copy with `tar xmf` (does not restore modification times):
 
   ```
-  tar cf - coco_run.py run-model.py util | ssh root@<board> "tar xmf - -C <bdir>"
+  tar cf - --exclude=__pycache__ --exclude=.pytest_cache -C eval coco_run.py litemono_run.py -C .. run-model.py util | ssh root@<board> "tar xmf - -C <bdir>"
   ```
 
 ## Models
@@ -71,6 +72,7 @@ COCO scripts.
 | `yolo-fastest` | [Yolo-Fastest 1.1](#yolov3-and-yolo-fastest) | 320×320, RGB 0..1, plain resize |
 | `yolo26` | [YOLO26n](#yolo26n) | 640×640, RGB 0..255, letterbox centered, pad 114 |
 | `ppocr` | [PP-OCR recognizer](#pp-ocr-recognizer) | 320×32, one text line, BGR; uint8 (kmodel) or -1..1 (ONNX) |
+| | [Lite-Mono](#lite-mono) (depth, no `--postprocess`) | 640×192, RGB; uint8 (kmodel) or 0..1 (ONNX) |
 
 All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yolo_post.py` decodes them.
 
@@ -80,15 +82,16 @@ All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yol
 
    ```
    python -c "from ultralytics import YOLO; YOLO('weights/yolo26n.pt')"
-   python yolo_to_onnx.py weights/yolo26n.pt onnx/yolo26n-640-nosplit.onnx
+   python convert/yolo_to_onnx.py weights/yolo26n.pt onnx/yolo26n-640.onnx
+   python convert/onnx_opt.py onnx/yolo26n-640.onnx onnx/yolo26n-640-nosplit.onnx
    ```
 
    The graph ends at the one-to-many head (`end2end=False`): per stride 8/16/32 a box map `[1, 4, H/s, W/s]`
    (l, t, r, b in strides) and a class-logit map `[1, 80, H/s, W/s]`, kept apart so each gets its own quantization
-   scale. BatchNorm and the 1/255 input scaling are folded, the `cv1(x).chunk(2)` of every C3k2 / C2PSA block is
-   exported as two convs and the qkv conv + split of both attention blocks as three (q, k, v), because nncase runs
-   Slice / Split on the CPU. `--keep-split` gives the original graph (same AP, about 20 ms slower on the K230 with
-   the same input type; see the results).
+   scale. BatchNorm and the 1/255 input scaling are folded. [`onnx_opt.py`](#onnx-rewrites) then makes the
+   `cv1(x).chunk(2)` of every C3k2 / C2PSA block two convs and the qkv conv + split of both attention blocks three
+   (q, k, v), because nncase runs Slice / Split on the CPU. `onnx/yolo26n-640.onnx` is the original graph (same AP, about
+   20 ms slower on the K230 with the same input type; see the results).
 
 2. Calibration set: 300 random train2017 images (seed 0):
 
@@ -119,10 +122,6 @@ All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yol
    Without the five pre-process lines the kmodel takes float32 0..255 input (about 4 ms slower per image).
 
    The original graph (the results' "original graph, float32 input" row):
-
-   ```
-   python yolo_to_onnx.py weights/yolo26n.pt onnx/yolo26n-640.onnx --keep-split
-   ```
 
    ```
    compile
@@ -267,11 +266,11 @@ The PaddleOCR English / number recognizer en_number_mobile_v2.0 (PP-OCRv1: Mobil
 blocks, two bidirectional LSTMs, CTC over 97 classes). The inputs:
 
 * `onnx/ppocr-en-rec-32x320.onnx`, the float model (`--onnx`): RapidOCR's ONNX of it, cut before the final Softmax
-  (output: the CTC logits `[1, 80, 97]`) and made static `1x3x32x320` by `ppocr_to_onnx.py` (needs onnxsim):
+  (output: the CTC logits `[1, 80, 97]`) and made static `1x3x32x320` by `convert/onnx_opt.py` (needs onnxsim):
 
   ```
   curl -L -o weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv1/en_number_mobile_v2.0_rec_infer.onnx
-  python ppocr_to_onnx.py weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx onnx/ppocr-en-rec-32x320.onnx
+  python convert/onnx_opt.py weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx onnx/ppocr-en-rec-32x320.onnx --input-shape 1,3,32,320 --cut ctc_fc.tmp_1 --output-shape 1,80,97 --optimize
   ```
 
   The character set (the model's `character` metadata) is built into `util/ocr_post.py`.
@@ -430,6 +429,87 @@ kmodel/yolo-fastest-1.1-320-qop.kmodel
 k230
 ```
 
+### Lite-Mono
+
+Monocular depth: [Lite-Mono](https://github.com/noahzn/Lite-Mono) (MIT), trained on KITTI, encoder and depth decoder as
+one model with the full resolution disparity as output, `disp [1, 1, 192, 640]`. Needs the repository's
+`networks/depth_encoder.py`, `networks/depth_decoder.py` and `layers.py` in `weights/lite-mono/upstream` and `encoder.pth`
+and `depth.pth` of a variant in `weights/lite-mono/<variant>` (the table in its README links them), and two KITTI raw
+drives with the calibration files, unpacked in `data/kitti` (they are in the Eigen test split, so the model did not
+train on them; drive 0002 calibrates, drive 0048 measures):
+
+```
+python convert/litemono_to_onnx.py weights/lite-mono/lite-mono-tiny onnx/lite-mono-tiny-640x192.onnx --model lite-mono-tiny
+python convert/onnx_opt.py onnx/lite-mono-tiny-640x192.onnx onnx/lite-mono-tiny-640x192-opt.onnx
+python convert/kitti_prepare.py data/kitti data/kitti-lm --calib 2011_09_26_drive_0002 --test 2011_09_26_drive_0048
+```
+
+```
+compile
+--dataset data/kitti-lm/calib-zoom
+--dataset-format Image
+--calib-image-resize=Letterbox
+--calib-bgr=false
+--calib-method NoClip
+--pre-process true
+--input-type Uint8
+--input-shape 1 3 192 640
+--input-layout NCHW
+--model-layout NCHW
+--input-range 0 1
+--model-quant-mode UsePTQ
+onnx/lite-mono-tiny-640x192-opt.onnx
+kmodel/lite-mono-tiny-640x192-opt-u8-zoom.kmodel
+k230
+```
+
+`calib-zoom` matters: the kmodel cannot output anything nearer than the calibration images show, and the 20 plain
+images cap the disparity at 0.685, about 5 m at KITTI scale. Zoomed crops raise that to 0.88.
+
+On the board or in the simulator, then on the PC:
+
+```
+python eval/litemono_run.py kmodel/lite-mono-tiny-640x192-opt-u8-zoom.kmodel --input data/kitti-lm/test --output data/kitti-lm/disp-tiny.npz
+python eval/litemono_eval.py --input data/kitti-lm/test --onnx onnx/lite-mono-tiny-640x192-opt.onnx --disp data/kitti-lm/disp-tiny.npz
+```
+
+22 frames of drive 0048 against the LiDAR, per image median scaling (not comparable with the paper's table), board time
+with a runtime that has the fast reflect Pad, Broadcast and GetItem:
+
+| Model | Runs on | abs-rel | abs-rel under 5 m | Time per image |
+|---|---|---|---|---|
+| lite-mono-tiny, float | onnxruntime | 0.107 | 0.256 | |
+| lite-mono-tiny, PTQ, rewritten | board | 0.113 | 0.291 | 78 ms |
+| lite-mono, float | onnxruntime | 0.117 | 0.262 | |
+| lite-mono, PTQ, rewritten by hand, same graph | board | 0.120 | 0.307 | 111 ms |
+
+The frame to frame sd of abs-rel is about 0.03. Most of the KPU time is DDR traffic: tiny's wait per KPU call fits
+91 us + 533 us per MB + 2.5 us per million MACs (R2 0.94).
+
+### ONNX rewrites
+
+`convert/onnx_opt.py <in> <out>` folds constants and rewrites a model into the form the K230 runs best;
+`convert/onnx_opt.py <in> --lint` only reports what is left that costs time. `util/onnx_rewrite.py` holds the rules: a
+`match` function that looks at a few nodes and shapes, and a `generate` function that returns the new nodes. Each rule
+is applied until it no longer matches, and the graph is compared with the original on a random input after every rule.
+
+| Rule | Pattern | Result |
+|---|---|---|
+| `split_silu_conv` | 1x1 Conv, SiLU, Slice / Split on channels | one Conv + SiLU per part |
+| `split_qkv_heads` | 1x1 Conv, Reshape, Split on the head axis | one Conv per part |
+| `split_qkv` | MatMul, Add, Reshape, Transpose, three Gather | three 1x1 Convs |
+| `matmul_to_conv` | MatMul with a constant on NHWC data | Transpose, 1x1 Conv, Transpose |
+| `tokens_to_nhwc`, `heads_to_tokens` | token Reshape / Transpose pairs | NHWC Transpose + token Reshape |
+| `sink_elementwise`, `sink_gelu`, `sink_layernorm`, `sink_matmul` | Transpose / token Reshape before an op | the same after it |
+| `merge_add` | Add of two equal wrappers | one wrapper after the Add |
+| `cancel_transposes`, `fold_reshapes` | NCHW / NHWC pairs, Reshape of a Reshape | gone |
+| `fold_conv_bias`, `fold_conv_scale`, `fold_conv_reshape_scale` | Add / Mul with a constant after a Conv | in the Conv |
+| `drop_expand` | Expand read as a divisor | gone, Div broadcasts |
+
+The reason for most of them: nncase cannot put a Reshape inside a layer group, so every layout change is a DDR round
+trip. The rules are narrow on purpose: they match only the ops, layouts and shapes seen in YOLO26 and Lite-Mono (they do
+nothing to PP-OCR and YOLOX). Add a pattern for a new model after looking at its graph, rather than loosening a rule.
+
 ## One image
 
 `tensor_from_image.py` writes the raw input tensor, `run-onnx.py` / `run-model.py` run the model and, with
@@ -482,7 +562,7 @@ model's own evaluation settings (`PREP` in `util/coco.py`).
 1. Prepare the inputs with the model's own evaluation preprocessing (5000 images; about 6 GB for 640×640):
 
    ```
-   python coco_prepare.py --detect yolo26 --output data/coco-yolo26
+   python eval/coco_prepare.py --detect yolo26 --output data/coco-yolo26
    ```
 
 2. Run the kmodel on the board and fetch the candidates. Only output cells whose score can reach the evaluation
@@ -495,12 +575,12 @@ model's own evaluation settings (`PREP` in `util/coco.py`).
    scp root@<board>:<bdir>/dets/yolo26.npz data/dets/
    ```
 
-   `coco_run.py` also works with the simulator (slow: use `--limit N`).
+   `eval/coco_run.py` also works with the simulator (slow: use `--limit N`).
 
 3. Score the kmodel candidates, and optionally ONNX models on the same tensors:
 
    ```
-   python coco_eval.py --input data/coco-yolo26 data/dets/yolo26.npz --onnx onnx/yolo26n-640-nosplit.onnx
+   python eval/coco_eval.py --input data/coco-yolo26 data/dets/yolo26.npz --onnx onnx/yolo26n-640-nosplit.onnx
    ```
 
 Evaluation settings per model:
@@ -565,6 +645,8 @@ onnx and onnx2torch.
 `tests/test_qat_calibrate.py` runs `qat_generic.calibrate` on the same models and compares every range group, for
 noclip and KLD, with the float tensors from onnxruntime; also the state after calibration and degenerate tensors.
 `kld_range` is compared with thresholds taken from nncase's own `Nncase.Quantization.dll`.
+`tests/test_onnx_rewrite.py` runs the rules of `util/onnx_rewrite.py` on small models in ONNX text syntax: the patterns
+they were written for and close variants that must stay as they are, the lint report and a wrong rule being caught.
 `tests/test_coco.py` runs `util/coco.py` on generated images, raw outputs and annotations: the input geometry of
 every detector against sizes worked out by hand, cells and candidates, NMS, the mapping back to the image, AP with
 known values, and a white rectangle followed from an image through to COCO results. Needs Pillow, OpenCV and

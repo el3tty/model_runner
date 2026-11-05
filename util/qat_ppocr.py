@@ -80,7 +80,7 @@ class PpocrTask(Task):
     supports_scheme = True
 
     def add_args(self, ap):
-        # the float recognizer, made by ppocr_to_onnx.py (input x 1x3x32x320, output the CTC logits [1, 80, 97]):
+        # the float recognizer, made by convert/onnx_opt.py (input x 1x3x32x320, output the CTC logits [1, 80, 97]):
         # the model the fake quantizers go into, and the teacher of the distillation
         ap.add_argument("--onnx", required=True, help="float recognizer, e.g. onnx/ppocr-en-rec-32x320.onnx")
         # written by python -m util.ocr_synth <dir>: test/*.u8 + labels.json (the words / CER evaluation), calib/*.png
