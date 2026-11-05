@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Export a QAT checkpoint of qat_train.py (best.pth, latest.pth or init.pth) for nncase:
 
-    python qat_export.py yolox qat_yolox/best.pth onnx/yolox-qat-kld.onnx --act-qdq
-    python qat_export.py ppocr qat_ppocr/best.pth onnx/ppocr-en-rec-qat.onnx --act-qdq
+    python qat_export.py yolox qat_yolox/best.pth build/onnx/yolox-qat-kld.onnx --act-qdq
+    python qat_export.py ppocr qat_ppocr/best.pth build/onnx/ppocr-en-rec-qat.onnx --act-qdq
     python qat_export.py <task> -h                    # the task's export options
 
 The ONNX of the fake-quant model: --act-qdq puts QuantizeLinear/DequantizeLinear pairs with the trained ranges on the

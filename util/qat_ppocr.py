@@ -82,10 +82,10 @@ class PpocrTask(Task):
     def add_args(self, ap):
         # the float recognizer, made by convert/onnx_opt.py (input x 1x3x32x320, output the CTC logits [1, 80, 97]):
         # the model the fake quantizers go into, and the teacher of the distillation
-        ap.add_argument("--onnx", required=True, help="float recognizer, e.g. onnx/ppocr-en-rec-32x320.onnx")
+        ap.add_argument("--onnx", required=True, help="float recognizer, e.g. build/onnx/ppocr-en-rec-32x320.onnx")
         # written by python -m util.ocr_synth <dir>: test/*.u8 + labels.json (the words / CER evaluation), calib/*.png
         # (the activation range calibration, the images nncase's --dataset would get)
-        ap.add_argument("--data", required=True, help="text line folder of util.ocr_synth, e.g. data/ocr-synth")
+        ap.add_argument("--data", required=True, help="text line folder of util.ocr_synth, e.g. build/data/ocr-synth")
         ap.add_argument("--fonts", default=None, help="directory with .ttf/.otf fonts for the training lines")
         ap.add_argument("--temperature", type=float, default=1.0, help="distillation temperature")
         ap.add_argument("--seed", type=int, default=0, help="seed of the training lines")

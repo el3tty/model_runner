@@ -3,7 +3,7 @@
 Compare Lite-Mono disparity maps (litemono_run.py) with the float ONNX model on the same frames, and both with the LiDAR
 ground truth of kitti_prepare.py.
 
-    python eval/litemono_eval.py --input data/kitti-lm/test --onnx onnx/lite-mono-tiny-640x192.onnx --disp data/kitti-lm/disp-tiny.npz
+    python eval/litemono_eval.py --input build/data/kitti-lm/test --onnx build/onnx/lite-mono-tiny-640x192.onnx --disp build/data/kitti-lm/disp-tiny.npz
 
 float vs kmodel: depth = 1 / (1/100 + (1/0.1 - 1/100) * disp) (Lite-Mono's disp_to_depth), abs-rel over all pixels.
 Against the LiDAR: the evaluation of monodepth2 / Lite-Mono on the raw points (the Eigen split's numbers use the same

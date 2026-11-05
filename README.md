@@ -21,7 +21,8 @@ Placeholders used below:
 | `<nncase>` | nncase checkout (K230 branch) |
 | `<board>` | the board's address; `<bdir>` a working folder on it |
 
-`data/`, `onnx/`, `kmodel/`, `weights/` are git-ignored: everything in them is produced by the commands below.
+`build/` is git-ignored: everything in it (`build/data`, `build/onnx`, `build/kmodel`, `build/weights`) is produced by
+the commands below.
 
 ## Requirements
 
@@ -81,16 +82,16 @@ All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yol
 1. Export (downloads `yolo26n.pt` from the Ultralytics release on first use):
 
    ```
-   python -c "from ultralytics import YOLO; YOLO('weights/yolo26n.pt')"
-   python convert/yolo_to_onnx.py weights/yolo26n.pt onnx/yolo26n-640.onnx
-   python convert/onnx_opt.py onnx/yolo26n-640.onnx onnx/yolo26n-640-nosplit.onnx
+   python -c "from ultralytics import YOLO; YOLO('build/weights/yolo26n.pt')"
+   python convert/yolo_to_onnx.py build/weights/yolo26n.pt build/onnx/yolo26n-640.onnx
+   python convert/onnx_opt.py build/onnx/yolo26n-640.onnx build/onnx/yolo26n-640-nosplit.onnx
    ```
 
    The graph ends at the one-to-many head (`end2end=False`): per stride 8/16/32 a box map `[1, 4, H/s, W/s]`
    (l, t, r, b in strides) and a class-logit map `[1, 80, H/s, W/s]`, kept apart so each gets its own quantization
    scale. BatchNorm and the 1/255 input scaling are folded. [`onnx_opt.py`](#onnx-rewrites) then makes the
    `cv1(x).chunk(2)` of every C3k2 / C2PSA block two convs and the qkv conv + split of both attention blocks three
-   (q, k, v), because nncase runs Slice / Split on the CPU. `onnx/yolo26n-640.onnx` is the original graph (same AP, about
+   (q, k, v), because nncase runs Slice / Split on the CPU. `build/onnx/yolo26n-640.onnx` is the original graph (same AP, about
    20 ms slower on the K230 with the same input type; see the results).
 
 2. Calibration set: 300 random train2017 images (seed 0):
@@ -114,8 +115,8 @@ All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yol
    --model-layout NCHW
    --input-range 0 255
    --model-quant-mode UsePTQ
-   onnx/yolo26n-640-nosplit.onnx
-   kmodel/yolo26n-640-nosplit-u8-ptq.kmodel
+   build/onnx/yolo26n-640-nosplit.onnx
+   build/kmodel/yolo26n-640-nosplit-u8-ptq.kmodel
    k230
    ```
 
@@ -131,8 +132,8 @@ All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yol
    --calib-bgr=false
    --input-range 0 255
    --model-quant-mode UsePTQ
-   onnx/yolo26n-640.onnx
-   kmodel/yolo26n-640-ptq.kmodel
+   build/onnx/yolo26n-640.onnx
+   build/kmodel/yolo26n-640-ptq.kmodel
    k230
    ```
 
@@ -215,7 +216,7 @@ now 73 and 7 only in the export) load with each range on the same tensor. Then:
 | task | data | training | metric | export |
 |---|---|---|---|---|
 | `yolox` | COCO, YOLOX's pipeline (mosaic / mixup, off for the last `--no-aug-epochs` epochs, with the L1 loss) | YOLOX's loss (labels), SGD, `--lr` per 64 images, stem conv frozen | AP on val2017 | ONNX with Q/DQ pairs |
-| `ppocr` | text lines rendered on the fly (`util/ocr_synth.py`) | distillation: KL of the float and the fake-quant model's per-time-step class distributions (no labels), Adam | words / CER on `data/ocr-synth` | ONNX with Q/DQ pairs |
+| `ppocr` | text lines rendered on the fly (`util/ocr_synth.py`) | distillation: KL of the float and the fake-quant model's per-time-step class distributions (no labels), Adam | words / CER on `build/data/ocr-synth` | ONNX with Q/DQ pairs |
 
 `qat_export.py <task> <checkpoint> <output.onnx> --act-qdq` exports a checkpoint for nncase: the fake-quant model
 traced to ONNX, every quantized activation with a QuantizeLinear / DequantizeLinear pair holding its trained range,
@@ -240,7 +241,7 @@ YOLOX release page):
 ```
 python qat_train.py yolox -c yolox_nano.pth --epochs 0 --out qat_yolox
 python qat_train.py yolox --init qat_yolox/init.pth --epochs 15 --eval-first --out qat_yolox
-python qat_export.py yolox qat_yolox/best.pth onnx/yolox-qat-kld.onnx --act-qdq
+python qat_export.py yolox qat_yolox/best.pth build/onnx/yolox-qat-kld.onnx --act-qdq
 ```
 
 The first line calibrates on `--calib-images` (512) random train2017 images and reports the PTQ AP (0.182, AP50 0.305);
@@ -255,8 +256,8 @@ decoding. The compile:
 compile
 --input-range 0 255
 --model-quant-mode UsePTQ
-onnx/yolox-qat-kld.onnx
-kmodel/yolox-qat-kld.kmodel
+build/onnx/yolox-qat-kld.onnx
+build/kmodel/yolox-qat-kld.kmodel
 k230
 ```
 
@@ -265,27 +266,27 @@ k230
 The PaddleOCR English / number recognizer en_number_mobile_v2.0 (PP-OCRv1: MobileNetV3 with squeeze-excitation
 blocks, two bidirectional LSTMs, CTC over 97 classes). The inputs:
 
-* `onnx/ppocr-en-rec-32x320.onnx`, the float model (`--onnx`): RapidOCR's ONNX of it, cut before the final Softmax
+* `build/onnx/ppocr-en-rec-32x320.onnx`, the float model (`--onnx`): RapidOCR's ONNX of it, cut before the final Softmax
   (output: the CTC logits `[1, 80, 97]`) and made static `1x3x32x320` by `convert/onnx_opt.py` (needs onnxsim):
 
   ```
-  curl -L -o weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv1/en_number_mobile_v2.0_rec_infer.onnx
-  python convert/onnx_opt.py weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx onnx/ppocr-en-rec-32x320.onnx --input-shape 1,3,32,320 --cut ctc_fc.tmp_1 --output-shape 1,80,97 --optimize
+  curl -L -o build/weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv1/en_number_mobile_v2.0_rec_infer.onnx
+  python convert/onnx_opt.py build/weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx build/onnx/ppocr-en-rec-32x320.onnx --input-shape 1,3,32,320 --cut ctc_fc.tmp_1 --output-shape 1,80,97 --optimize
   ```
 
   The character set (the model's `character` metadata) is built into `util/ocr_post.py`.
-* `data/ocr-synth`, rendered text lines (`--data`): `test/*.u8` with `labels.json` (1000 lines, the words / CER
+* `build/data/ocr-synth`, rendered text lines (`--data`): `test/*.u8` with `labels.json` (1000 lines, the words / CER
   evaluation) and `calib/*.png` (100 lines, the range calibration and nncase's `--dataset`). The fonts are those of
   the training lines (below); the set used for the results here was rendered with the Windows fonts:
 
   ```
-  python -m util.ocr_synth data/ocr-synth
+  python -m util.ocr_synth build/data/ocr-synth
   ```
 
 ```
-python qat_train.py ppocr --onnx onnx/ppocr-en-rec-32x320.onnx --data data/ocr-synth --epochs 0 --out qat_ppocr
-python qat_train.py ppocr --onnx onnx/ppocr-en-rec-32x320.onnx --data data/ocr-synth --init qat_ppocr/init.pth -b 128 --epochs 20 --out qat_ppocr
-python qat_export.py ppocr qat_ppocr/best.pth onnx/ppocr-en-rec-qat.onnx --act-qdq
+python qat_train.py ppocr --onnx build/onnx/ppocr-en-rec-32x320.onnx --data build/data/ocr-synth --epochs 0 --out qat_ppocr
+python qat_train.py ppocr --onnx build/onnx/ppocr-en-rec-32x320.onnx --data build/data/ocr-synth --init qat_ppocr/init.pth -b 128 --epochs 20 --out qat_ppocr
+python qat_export.py ppocr qat_ppocr/best.pth build/onnx/ppocr-en-rec-qat.onnx --act-qdq
 ```
 
 The calibrated model scores what the board does (PTQ: 0.853 words / CER 0.029, the board 0.855 / 0.029; float
@@ -296,15 +297,15 @@ mapped like the K230's pre-process, `(x - 128) / 127.5` (nncase's integer zero p
 Training speed: the LSTMs run step by step in Python, about 125 lines/s on the test PC at `-b 128` (`-b 256` does not
 fit in its 6 GB); the default 20 x 1000 x 128 lines took 5.6 hours there (the best epoch was the third: `--epochs 5`
 would have done). Fonts for the training lines:
-`--fonts <dir>` (every `.ttf` / `.otf` in it), else the Windows fonts `data/ocr-synth` was made with, else the DejaVu
+`--fonts <dir>` (every `.ttf` / `.otf` in it), else the Windows fonts `build/data/ocr-synth` was made with, else the DejaVu
 / Liberation fonts of a Linux system (`apt-get install fonts-dejavu-core fonts-liberation`).
 
-The PTQ build (the float model, calibrated by nncase on `data/ocr-synth/calib`; uint8 BGR input, which the
+The PTQ build (the float model, calibrated by nncase on `build/data/ocr-synth/calib`; uint8 BGR input, which the
 pre-process maps to -1..1):
 
 ```
 compile
---dataset data/ocr-synth/calib
+--dataset build/data/ocr-synth/calib
 --dataset-format Image
 --calib-image-resize=Letterbox
 --calib-bgr=true
@@ -315,8 +316,8 @@ compile
 --model-layout NCHW
 --input-range -1 1
 --model-quant-mode UsePTQ
-onnx/ppocr-en-rec-32x320.onnx
-kmodel/ppocr-en-rec-32x320.kmodel
+build/onnx/ppocr-en-rec-32x320.onnx
+build/kmodel/ppocr-en-rec-32x320.kmodel
 k230
 ```
 
@@ -332,8 +333,8 @@ compile
 --model-layout NCHW
 --input-range -1 1
 --model-quant-mode UsePTQ
-onnx/ppocr-en-rec-qat.onnx
-kmodel/ppocr-en-rec-qat.kmodel
+build/onnx/ppocr-en-rec-qat.onnx
+build/kmodel/ppocr-en-rec-qat.kmodel
 k230
 ```
 
@@ -350,13 +351,13 @@ with a network volume (`/workspace` survives pod restarts; everything else does 
 `<pod-ip>` and `<port>` from the pod's Connect page, `<key>` the SSH key added to RunPod.
 
 On the PC, pack this repository (git bundle: no remote needed) and copy it with what the task needs (YOLOX: the float
-checkpoint; PP-OCR: the float model and `data/ocr-synth`, about 40 MB):
+checkpoint; PP-OCR: the float model and `build/data/ocr-synth`, about 40 MB):
 
 ```
 git bundle create model_runner.bundle master
 scp -i <key> -P <port> model_runner.bundle yolox_nano.pth root@<pod-ip>:/workspace/
-scp -i <key> -P <port> onnx/ppocr-en-rec-32x320.onnx root@<pod-ip>:/workspace/
-scp -i <key> -P <port> -r data/ocr-synth root@<pod-ip>:/workspace/
+scp -i <key> -P <port> build/onnx/ppocr-en-rec-32x320.onnx root@<pod-ip>:/workspace/
+scp -i <key> -P <port> -r build/data/ocr-synth root@<pod-ip>:/workspace/
 ssh -i <key> -p <port> root@<pod-ip>
 ```
 
@@ -368,7 +369,7 @@ On the pod: system packages, this repository and its PP-OCR files; for YOLOX als
 apt-get update && apt-get install -y libgl1 libglib2.0-0 tmux unzip rsync fonts-dejavu-core fonts-liberation
 pip install onnx onnxruntime onnx2torch pillow
 cd /workspace && git clone model_runner.bundle model_runner && cd model_runner
-mkdir -p onnx data && mv ../ppocr-en-rec-32x320.onnx onnx/ && mv ../ocr-synth data/ && mv ../yolox_nano.pth .
+mkdir -p build/onnx build/data && mv ../ppocr-en-rec-32x320.onnx build/onnx/ && mv ../ocr-synth build/data/ && mv ../yolox_nano.pth .
 cd /workspace && git clone https://github.com/Megvii-BaseDetection/YOLOX && cd YOLOX
 sed -i '/onnx-simplifier/d' requirements.txt && pip install -r requirements.txt && pip install -v -e . --no-build-isolation
 mkdir -p /workspace/datasets/COCO && cd /workspace/datasets/COCO
@@ -391,7 +392,7 @@ tmux new -s qat
 export YOLOX_DATADIR=/workspace/datasets
 cd /workspace/model_runner
 python qat_train.py yolox -c yolox_nano.pth --epochs 15 --workers 8 --eval-first --out qat_yolox 2>&1 | tee train-yolox.log
-python qat_train.py ppocr --onnx onnx/ppocr-en-rec-32x320.onnx --data data/ocr-synth -b 128 --epochs 20 --workers 8 --eval-first --out qat_ppocr 2>&1 | tee train-ppocr.log
+python qat_train.py ppocr --onnx build/onnx/ppocr-en-rec-32x320.onnx --data build/data/ocr-synth -b 128 --epochs 20 --workers 8 --eval-first --out qat_ppocr 2>&1 | tee train-ppocr.log
 ```
 
 If the pod restarts, continue with `--resume <out>/latest.pth` and the same other arguments. `nvidia-smi -l 1` shows
@@ -399,7 +400,7 @@ the GPU load (YOLOX: expect well under 100%, the CPUs are the limit). Back on th
 
 ```
 scp -i <key> -P <port> -r root@<pod-ip>:/workspace/model_runner/qat_yolox .
-python qat_export.py yolox qat_yolox/best.pth onnx/yolox-qat-kld.onnx --act-qdq
+python qat_export.py yolox qat_yolox/best.pth build/onnx/yolox-qat-kld.onnx --act-qdq
 ```
 
 ### YOLOv3 and Yolo-Fastest
@@ -416,16 +417,16 @@ How they were made is not scripted here:
 compile
 --input-range 0 1
 --model-quant-mode UsePTQ
-onnx/yolov3-12-int8-heads.onnx
-kmodel/yolov3-12-int8.kmodel
+build/onnx/yolov3-12-int8-heads.onnx
+build/kmodel/yolov3-12-int8.kmodel
 k230
 ```
 
 ```
 compile
 --model-quant-mode UsePTQ
-onnx/yolo-fastest-1.1-320_int8_qop.onnx
-kmodel/yolo-fastest-1.1-320-qop.kmodel
+build/onnx/yolo-fastest-1.1-320_int8_qop.onnx
+build/kmodel/yolo-fastest-1.1-320-qop.kmodel
 k230
 ```
 
@@ -433,20 +434,20 @@ k230
 
 Monocular depth: [Lite-Mono](https://github.com/noahzn/Lite-Mono) (MIT), trained on KITTI, encoder and depth decoder as
 one model with the full resolution disparity as output, `disp [1, 1, 192, 640]`. Needs the repository's
-`networks/depth_encoder.py`, `networks/depth_decoder.py` and `layers.py` in `weights/lite-mono/upstream` and `encoder.pth`
-and `depth.pth` of a variant in `weights/lite-mono/<variant>` (the table in its README links them), and two KITTI raw
-drives with the calibration files, unpacked in `data/kitti` (they are in the Eigen test split, so the model did not
+`networks/depth_encoder.py`, `networks/depth_decoder.py` and `layers.py` in `build/weights/lite-mono/upstream` and `encoder.pth`
+and `depth.pth` of a variant in `build/weights/lite-mono/<variant>` (the table in its README links them), and two KITTI raw
+drives with the calibration files, unpacked in `build/data/kitti` (they are in the Eigen test split, so the model did not
 train on them; drive 0002 calibrates, drive 0048 measures):
 
 ```
-python convert/litemono_to_onnx.py weights/lite-mono/lite-mono-tiny onnx/lite-mono-tiny-640x192.onnx --model lite-mono-tiny
-python convert/onnx_opt.py onnx/lite-mono-tiny-640x192.onnx onnx/lite-mono-tiny-640x192-opt.onnx
-python convert/kitti_prepare.py data/kitti data/kitti-lm --calib 2011_09_26_drive_0002 --test 2011_09_26_drive_0048
+python convert/litemono_to_onnx.py build/weights/lite-mono/lite-mono-tiny build/onnx/lite-mono-tiny-640x192.onnx --model lite-mono-tiny
+python convert/onnx_opt.py build/onnx/lite-mono-tiny-640x192.onnx build/onnx/lite-mono-tiny-640x192-opt.onnx
+python convert/kitti_prepare.py build/data/kitti build/data/kitti-lm --calib 2011_09_26_drive_0002 --test 2011_09_26_drive_0048
 ```
 
 ```
 compile
---dataset data/kitti-lm/calib-zoom
+--dataset build/data/kitti-lm/calib-zoom
 --dataset-format Image
 --calib-image-resize=Letterbox
 --calib-bgr=false
@@ -458,8 +459,8 @@ compile
 --model-layout NCHW
 --input-range 0 1
 --model-quant-mode UsePTQ
-onnx/lite-mono-tiny-640x192-opt.onnx
-kmodel/lite-mono-tiny-640x192-opt-u8-zoom.kmodel
+build/onnx/lite-mono-tiny-640x192-opt.onnx
+build/kmodel/lite-mono-tiny-640x192-opt-u8-zoom.kmodel
 k230
 ```
 
@@ -469,8 +470,8 @@ images cap the disparity at 0.685, about 5 m at KITTI scale. Zoomed crops raise 
 On the board or in the simulator, then on the PC:
 
 ```
-python eval/litemono_run.py kmodel/lite-mono-tiny-640x192-opt-u8-zoom.kmodel --input data/kitti-lm/test --output data/kitti-lm/disp-tiny.npz
-python eval/litemono_eval.py --input data/kitti-lm/test --onnx onnx/lite-mono-tiny-640x192-opt.onnx --disp data/kitti-lm/disp-tiny.npz
+python eval/litemono_run.py build/kmodel/lite-mono-tiny-640x192-opt-u8-zoom.kmodel --input build/data/kitti-lm/test --output build/data/kitti-lm/disp-tiny.npz
+python eval/litemono_eval.py --input build/data/kitti-lm/test --onnx build/onnx/lite-mono-tiny-640x192-opt.onnx --disp build/data/kitti-lm/disp-tiny.npz
 ```
 
 22 frames of drive 0048 against the LiDAR, per image median scaling (not comparable with the paper's table), board time
@@ -526,29 +527,29 @@ into an image:
 Example (YOLO26):
 
 ```
-python tensor_from_image.py data/test.jpg 640x640 --letterbox --pad 114 --type f32 --output data/yolo26/yolo26-f32.in
-python run-onnx.py onnx/yolo26n-640-nosplit.onnx data/yolo26/yolo26-f32.in --postprocess yolo26 --output-prefix=data/yolo26/out-onnx-
-python tensor_to_image.py data/yolo26/out-onnx-yolo26.rgb 640x640 f32 --format bmp --output data/yolo26/out-onnx-yolo26.bmp
+python tensor_from_image.py build/data/test.jpg 640x640 --letterbox --pad 114 --type f32 --output build/data/yolo26/yolo26-f32.in
+python run-onnx.py build/onnx/yolo26n-640-nosplit.onnx build/data/yolo26/yolo26-f32.in --postprocess yolo26 --output-prefix=build/data/yolo26/out-onnx-
+python tensor_to_image.py build/data/yolo26/out-onnx-yolo26.rgb 640x640 f32 --format bmp --output build/data/yolo26/out-onnx-yolo26.bmp
 ```
 
 On the board (or in the simulator) with the u8 kmodel:
 
 ```
-python tensor_from_image.py data/test.jpg 640x640 --letterbox --pad 114 --type u8 --output data/yolo26/yolo26-u8.in
+python tensor_from_image.py build/data/test.jpg 640x640 --letterbox --pad 114 --type u8 --output build/data/yolo26/yolo26-u8.in
 python3 run-model.py yolo26n-640-nosplit-u8-ptq.kmodel yolo26-u8.in --postprocess yolo26 --output-prefix out-
 ```
 
 These single-image inputs use Pillow's resize, so they differ slightly from the COCO inputs below.
 
 Text recognition (PP-OCR): `--postprocess ppocr` decodes the CTC output and prints the text (`util/ocr_post.py`). The
-input is a uint8 BGR `1x3x32x320` text line, e.g. a `data/ocr-synth/test/*.u8` file (labels in
-`data/ocr-synth/labels.json`) or `tensor_from_image.py <line image> 320x32 --bgr` (plain resize: crop the image
+input is a uint8 BGR `1x3x32x320` text line, e.g. a `build/data/ocr-synth/test/*.u8` file (labels in
+`build/data/ocr-synth/labels.json`) or `tensor_from_image.py <line image> 320x32 --bgr` (plain resize: crop the image
 to one line of text first). The kmodel (built with `--pre-process`) takes the file as it is; `run-onnx.py
 --input-range -1 1` maps it like the kmodel's pre-process, `(x - 128) / 127.5`, for the float or QAT ONNX:
 
 ```
-python run-onnx.py onnx/ppocr-en-rec-qat.onnx data/ocr-synth/test/0001.u8 --input-range -1 1 --postprocess ppocr
-python run-model.py kmodel/ppocr-en-rec-qat.kmodel data/ocr-synth/test/0001.u8 --postprocess ppocr
+python run-onnx.py build/onnx/ppocr-en-rec-qat.onnx build/data/ocr-synth/test/0001.u8 --input-range -1 1 --postprocess ppocr
+python run-model.py build/kmodel/ppocr-en-rec-qat.kmodel build/data/ocr-synth/test/0001.u8 --postprocess ppocr
 ```
 
 `run-onnx.py` runs onnxruntime without graph optimizations, which would turn the Q/DQ pairs of a QAT export into
@@ -562,17 +563,17 @@ model's own evaluation settings (`PREP` in `util/coco.py`).
 1. Prepare the inputs with the model's own evaluation preprocessing (5000 images; about 6 GB for 640×640):
 
    ```
-   python eval/coco_prepare.py --detect yolo26 --output data/coco-yolo26
+   python eval/coco_prepare.py --detect yolo26 --output build/data/coco-yolo26
    ```
 
 2. Run the kmodel on the board and fetch the candidates. Only output cells whose score can reach the evaluation
    threshold are kept, as float16:
 
    ```
-   tar cf - -C data coco-yolo26 | ssh root@<board> "tar xmf - -C <bdir>/data"
-   scp kmodel/yolo26n-640-nosplit-u8-ptq.kmodel root@<board>:<bdir>/
+   tar cf - -C build/data coco-yolo26 | ssh root@<board> "tar xmf - -C <bdir>/data"
+   scp build/kmodel/yolo26n-640-nosplit-u8-ptq.kmodel root@<board>:<bdir>/
    ssh root@<board> "cd <bdir> && python3 coco_run.py yolo26n-640-nosplit-u8-ptq.kmodel --input data/coco-yolo26 --output dets/yolo26.npz"
-   scp root@<board>:<bdir>/dets/yolo26.npz data/dets/
+   scp root@<board>:<bdir>/dets/yolo26.npz build/data/dets/
    ```
 
    `eval/coco_run.py` also works with the simulator (slow: use `--limit N`).
@@ -580,7 +581,7 @@ model's own evaluation settings (`PREP` in `util/coco.py`).
 3. Score the kmodel candidates, and optionally ONNX models on the same tensors:
 
    ```
-   python eval/coco_eval.py --input data/coco-yolo26 data/dets/yolo26.npz --onnx onnx/yolo26n-640-nosplit.onnx
+   python eval/coco_eval.py --input build/data/coco-yolo26 build/data/dets/yolo26.npz --onnx build/onnx/yolo26n-640-nosplit.onnx
    ```
 
 Evaluation settings per model:
@@ -634,7 +635,7 @@ errors. `tests/test_yolo_post.py` encodes known boxes into the raw head outputs 
 detections with them: every stride, per-class NMS, the score threshold, outputs in any order, and the errors.
 `tests/test_ocr_post.py` does the same for `--postprocess ppocr`: text encoded as CTC logits (repeats, blanks, every
 character, the longest line), the printed text and confidence, and the errors; one test compares the built-in
-character set with the PaddleOCR model's metadata and is skipped without `weights/ppocr`.
+character set with the PaddleOCR model's metadata and is skipped without `build/weights/ppocr`.
 `tests/test_qat_graph.py` writes small models in ONNX text syntax (conv / activation chains, SiLU and HardSwish
 patterns, MaxPool, Concat, nearest Resize, residual Adds, an activation beside another reader, squeeze-excitation,
 pooling + Gemm, LSTM), runs `qat_graph.load` and `make_quantizable`, exports them with `--act-qdq` and compares the

@@ -1,10 +1,5 @@
+build
 nncaseruntime
-rt-dumps
-kmodel
-onnx
-temp
-data
-weights
 __pycache__
 *.bat
 .pytest_cache

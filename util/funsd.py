@@ -2,7 +2,7 @@
 """A real-text test set for the PP-OCR recognizer: the text lines of the FUNSD test forms, in the folder format of
 util.ocr_synth, so the same evaluation reads it.
 
-    python -m util.funsd data/funsd/dataset.zip data/funsd/lines
+    python -m util.funsd build/data/funsd/dataset.zip build/data/funsd/lines
 
 dataset.zip comes from https://guillaumejaume.github.io/FUNSD/ (non-commercial research and education only, the images
 stay under copyright: keep it and the crops out of the repository). It writes <out>/test/<i>.u8 (1x3x32x320 BGR uint8)

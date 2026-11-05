@@ -4,7 +4,7 @@
     python -m util.ocr_synth <out_dir> [--test 1000] [--calib 100] [--fonts DIR]
 
 writes <out>/calib/*.png (already 320x32, so nncase's resize is the identity), <out>/test/<i>.u8 (1x3x32x320 BGR uint8)
-and <out>/labels.json. data/ocr-synth was made this way with the Windows fonts. OcrLines renders lines on the fly
+and <out>/labels.json. build/data/ocr-synth was made this way with the Windows fonts. OcrLines renders lines on the fly
 for training (ppocr_qat_train.py), so no data set has to be stored or uploaded.
 
 A line: a random word, number, date, price or symbol-joined pair (word()), one random font and size, a grey background

@@ -4,9 +4,9 @@ Export Lite-Mono (monocular depth, https://github.com/noahzn/Lite-Mono, MIT) to 
 depth decoder together, input x [1, 3, 192, 640] (RGB, 0..1), output disp [1, 1, 192, 640] (sigmoid disparity, 0..1,
 the full resolution scale only: the other decoder outputs are training losses and are dropped).
 
-    python convert/litemono_to_onnx.py weights/lite-mono/lite-mono-tiny onnx/lite-mono-tiny-640x192.onnx --model lite-mono-tiny
+    python convert/litemono_to_onnx.py build/weights/lite-mono/lite-mono-tiny build/onnx/lite-mono-tiny-640x192.onnx --model lite-mono-tiny
 
-<upstream> (--upstream, default weights/lite-mono/upstream) holds networks/depth_encoder.py, networks/depth_decoder.py
+<upstream> (--upstream, default build/weights/lite-mono/upstream) holds networks/depth_encoder.py, networks/depth_decoder.py
 and layers.py of the repository. The weights folder holds encoder.pth and depth.pth, loaded with weights_only=True.
 The result is compared with the PyTorch model on onnxruntime. convert/onnx_opt.py then turns it into the form the K230 runs
 best (about 40% less time on the board). timm is not needed: the model takes only DropPath
@@ -92,7 +92,7 @@ def main():
     ap.add_argument("weights", help="folder with encoder.pth and depth.pth")
     ap.add_argument("output", help="output .onnx")
     ap.add_argument("--model", default="lite-mono-tiny", choices=("lite-mono", "lite-mono-small", "lite-mono-tiny", "lite-mono-8m"))
-    ap.add_argument("--upstream", default="weights/lite-mono/upstream", help="folder with the repository's source files")
+    ap.add_argument("--upstream", default="build/weights/lite-mono/upstream", help="folder with the repository's source files")
     ap.add_argument("--opset", type=int, default=13, help="below 17 LayerNorm and GELU are spelled out, as nncase's "
                                                           "importer and its fold rules expect (default: 13)")
     args = ap.parse_args()

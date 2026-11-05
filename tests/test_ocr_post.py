@@ -124,7 +124,7 @@ def test_wrong_output_shape(shape, capsys):
 def test_charset_matches_the_model():
     """The built-in character set is the 'character' metadata of the original PaddleOCR model."""
     onnx = pytest.importorskip("onnx")
-    path = Path(__file__).resolve().parent.parent / "weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx"
+    path = Path(__file__).resolve().parent.parent / "build/weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx"
     if not path.exists():
         pytest.skip(f"{path} not found")
     meta = {p.key: p.value for p in onnx.load(str(path)).metadata_props}

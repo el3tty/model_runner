@@ -34,7 +34,7 @@ Examples:
     python tensor_from_image.py test.jpg 320x320 --range 1 --type f32 --output fastest.in
     python run-onnx.py yolo-fastest-1.1-320_int8_qop.onnx fastest.in --postprocess yolo-fastest
 
-    python run-onnx.py ppocr-en-rec-qat.onnx data/ocr-synth/test/0000.u8 --input-range -1 1 --postprocess ppocr
+    python run-onnx.py ppocr-en-rec-qat.onnx build/data/ocr-synth/test/0000.u8 --input-range -1 1 --postprocess ppocr
 """
 import argparse
 import os

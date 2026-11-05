@@ -3,7 +3,7 @@
 Lite-Mono inputs from KITTI raw drives (image_02, the left colour camera), resized the way monodepth2 / Lite-Mono do:
 Pillow LANCZOS to 640x192, plain resize.
 
-    python convert/kitti_prepare.py data/kitti data/kitti-lm --calib 2011_09_26_drive_0002 --test 2011_09_26_drive_0048
+    python convert/kitti_prepare.py build/data/kitti build/data/kitti-lm --calib 2011_09_26_drive_0002 --test 2011_09_26_drive_0048
 
 <out>/calib/*.png: the calibration images (nncase's --dataset; already 640x192, so its resize leaves them alone).
 <out>/calib-zoom/*.png: the same and bottom crops of the calibration drive zoomed 2x and 3x. Use this set: the kmodel

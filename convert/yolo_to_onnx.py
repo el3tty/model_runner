@@ -14,8 +14,8 @@ centered, pad 114: coco_prepare.py --detect yolo26). convert/onnx_opt.py then re
 C2PSA and attention blocks by separate convs, because nncase runs those on the CPU.
 
 Usage:
-    python convert/yolo_to_onnx.py weights/yolo26n.pt onnx/yolo26n-640.onnx [--size 640] [--opset 13]
-    python convert/yolo_to_onnx.py weights/yolo12n.pt onnx/yolo12n-640.onnx
+    python convert/yolo_to_onnx.py build/weights/yolo26n.pt build/onnx/yolo26n-640.onnx [--size 640] [--opset 13]
+    python convert/yolo_to_onnx.py build/weights/yolo12n.pt build/onnx/yolo12n-640.onnx
 """
 import argparse
 import inspect

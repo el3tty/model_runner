@@ -25,7 +25,7 @@ model's input size. The expected shape and size are printed on error.
   u8, u16, f16 or f32 (as the model expects).
   ppocr: the output is decoded as the CTC logits of the PP-OCR recognizer and
   the text is printed (util/ocr_post.py); the kmodel built with --pre-process
-  takes the uint8 BGR 1x3x32x320 image (e.g. data/ocr-synth/test/*.u8).
+  takes the uint8 BGR 1x3x32x320 image (e.g. build/data/ocr-synth/test/*.u8).
 
 Usage:
     python run-model.py model.kmodel input.in [--output-prefix output] [--dump-outputs]

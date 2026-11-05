@@ -2,7 +2,7 @@
 Text recognizer post-processing shared by run-model.py (K230 board / simulator) and run-onnx.py (onnxruntime), for
 the model selected with --postprocess (util/postprocess.py):
 
-  ppocr   PP-OCR en_number_mobile_v2.0 recognizer (onnx/ppocr-en-rec-32x320.onnx and its QAT export): input
+  ppocr   PP-OCR en_number_mobile_v2.0 recognizer (build/onnx/ppocr-en-rec-32x320.onnx and its QAT export): input
           1x3x32x320 BGR, output [1, 80, 97] CTC logits per time step. The kmodel (--pre-process, --input-range -1 1)
           takes the uint8 image; the ONNX model takes it mapped to -1..1 as (x - 128) / 127.5 (run-onnx.py
           --input-range -1 1 does that from the same uint8 file).

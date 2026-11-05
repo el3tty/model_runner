@@ -3,8 +3,8 @@
 Rewrite an ONNX model into the form the K230 compile path runs best (util/onnx_rewrite.py), and report what is left
 that will cost time on the K230:
 
-    python convert/onnx_opt.py onnx/lite-mono-tiny-640x192.onnx onnx/lite-mono-tiny-640x192-opt.onnx
-    python convert/onnx_opt.py onnx/some-model.onnx --lint
+    python convert/onnx_opt.py build/onnx/lite-mono-tiny-640x192.onnx build/onnx/lite-mono-tiny-640x192-opt.onnx
+    python convert/onnx_opt.py build/onnx/some-model.onnx --lint
 
 The model is constant folded first (onnxsim, without its optimizers: they fold the 0.5 of a GELU into the next Conv,
 and nncase then fails on the Erf left behind). The rules match only the patterns seen so far; the output says which ones
@@ -14,9 +14,9 @@ A model from elsewhere may need preparing first. The PP-OCR recognizer as RapidO
 en_number_mobile_v2.0: CRNN = MobileNetV3 with squeeze-excitation, two bidirectional LSTMs, CTC; 97 classes) has a dynamic
 input and ends in a Softmax. Cut before it, made static, with its BatchNorm folded by the optimizers (it has no GELU):
 
-    curl -L -o weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx \
+    curl -L -o build/weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx \
         https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv1/en_number_mobile_v2.0_rec_infer.onnx
-    python convert/onnx_opt.py weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx onnx/ppocr-en-rec-32x320.onnx \
+    python convert/onnx_opt.py build/weights/ppocr/en_number_mobile_v2.0_rec_infer.onnx build/onnx/ppocr-en-rec-32x320.onnx \
         --input-shape 1,3,32,320 --cut ctc_fc.tmp_1 --output-shape 1,80,97 --optimize
 
 --output-shape also gives the Reshape that writes the output a constant shape (PP-OCR's takes it from Shape / Slice /
