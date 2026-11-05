@@ -150,6 +150,20 @@ quantizes, by graph rules, on a `torch.fx` graph (YOLOX: the float model traced;
 * the LSTM (`QLSTM`): the KPU runs it with uint8 x, W, R (per row) and hidden state, and an fp16 cell state; the
   fake-quant version quantizes the hidden state at every time step (the tensor stored as Y and fed back).
 
+**Where the Q/DQ pairs go.** A `--act-qdq` export has a QuantizeLinear -> DequantizeLinear pair on an activation in
+exactly three cases (PP-OCR: 71 + 2 + 7 = 80 pairs):
+
+1. a tensor the K230 stores as uint8 and a quantized op reads, directly or through ops that keep the grid: the output of
+   a quantized op, after its fused activation. Rounded in training too;
+2. the hidden state output of an LSTM. Rounded in training too, at every time step;
+3. a Conv / Gemm output without an activation that goes into an Add / Mul and is not stored as uint8 for another reader:
+   the pair goes on the edge into the Add / Mul only. Not rounded, in training or on the K230 (float16): it only gives
+   nncase the range without which that Add / Mul leaves the KPU.
+
+There is no pair on the model input (uint8 already), between an op and its fused activation, after an op that keeps the
+grid (it shares the range of its input), on a tensor no quantized op reads (e.g. the model output) or on the weights
+(baked onto their grid, unless `--weight-qdq`).
+
 For YOLOX these rules give exactly the placement of the former hand-written code (111 activation quantizers in 99
 range groups, each at the same tensor). Checkpoints made before the float16 rule (PP-OCR: 80 activation quantizers,
 now 73 and 7 only in the export) load with each range on the same tensor. Then:
