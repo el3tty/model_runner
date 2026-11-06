@@ -26,16 +26,20 @@ model's input size. The expected shape and size are printed on error.
   ppocr: the output is decoded as the CTC logits of the PP-OCR recognizer and
   the text is printed (util/ocr_post.py); the kmodel built with --pre-process
   takes the uint8 BGR 1x3x32x320 image (e.g. build/data/ocr-synth/test/*.u8).
+  litemono: the depth map is written to <prefix>litemono.rgb as a uint8 RGB
+  1x3xHxW tensor in the magma color map, pale yellow close and black far
+  (util/litemono_post.py).
 
 Usage:
     python run-model.py model.kmodel input.in [--output-prefix output] [--dump-outputs]
                         [--dump-root DIR]
-                        [--postprocess yolox|yolov3|yolo-fastest|yolo26|ppocr]
+                        [--postprocess yolox|yolov3|yolo-fastest|yolo26|ppocr|litemono]
 
 Example:
     python run-model.py yolox-qat.kmodel yolox-f32-bgr.in --output-prefix out_ --postprocess yolox --dump-outputs
     # -> out_0.txt, out_1.txt, ..., out_yolox.rgb
     python run-model.py ppocr-en-rec-qat.kmodel 0000.u8 --postprocess ppocr
+    python run-model.py lite-mono-tiny-640x192-opt-u8-zoom.kmodel 0000000000.u8 --postprocess litemono
 """
 
 import argparse

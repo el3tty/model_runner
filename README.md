@@ -100,7 +100,7 @@ COCO scripts.
 | `yolo-fastest` | [Yolo-Fastest 1.1](#yolov3-and-yolo-fastest) | 320×320, RGB 0..1, plain resize |
 | `yolo26` | [YOLO26n](#yolo26n) | 640×640, RGB 0..255, letterbox centered, pad 114 |
 | `ppocr` | [PP-OCR recognizer](#pp-ocr-recognizer) | 320×32, one text line, BGR; uint8 (kmodel) or -1..1 (ONNX) |
-| | [Lite-Mono](#lite-mono) (depth, no `--postprocess`) | 640×192, RGB; uint8 (kmodel) or 0..1 (ONNX) |
+| `litemono` | [Lite-Mono](#lite-mono) (depth) | 640×192, RGB; uint8 (kmodel) or 0..1 (ONNX) |
 
 All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yolo_post.py` decodes them.
 
@@ -769,6 +769,19 @@ python run-onnx.py build/onnx/ppocr-en-rec-qat.onnx build/data/ocr-synth/test/00
 python run-model.py build/kmodel/ppocr-en-rec-qat.kmodel build/data/ocr-synth/test/0001.u8 --postprocess ppocr
 ```
 
+Depth (Lite-Mono): `--postprocess litemono` saves the depth map as an image in the magma color map: pale yellow close,
+through orange and purple, to black far (`util/litemono_post.py`). The color follows the model's disparity, 0..1, on the
+same scale for every image and model, so the float model and a kmodel can be compared by eye. Distances are relative:
+there are no metres in the picture. The
+input is a uint8 RGB `1x3x192x640` image, a `build/data/kitti-lm/test/*.u8` file or `tensor_from_image.py <image>
+640x192`. `run-onnx.py --input-range 0 1` runs the float model on the same file, and the result is uint8 either way:
+
+```
+python run-onnx.py build/onnx/lite-mono-tiny-640x192-opt.onnx build/data/kitti-lm/test/0000000000.u8 --input-range 0 1 --postprocess litemono --output-prefix=build/data/kitti-lm/onnx-
+python run-model.py build/kmodel/lite-mono-tiny-opt-640x192-u8-zoom.kmodel build/data/kitti-lm/test/0000000000.u8 --postprocess litemono --output-prefix=build/data/kitti-lm/kmodel-
+python tensor_to_image.py build/data/kitti-lm/onnx-litemono.rgb 640x192 --output build/data/kitti-lm/onnx-depth.png
+```
+
 `run-onnx.py` runs onnxruntime without graph optimizations, which would turn the Q/DQ pairs of a QAT export into
 integer kernels that round differently.
 
@@ -853,6 +866,8 @@ detections with them: every stride, per-class NMS, the score threshold, outputs 
 `tests/test_ocr_post.py` does the same for `--postprocess ppocr`: text encoded as CTC logits (repeats, blanks, every
 character, the longest line), the printed text and confidence, and the errors; one test compares the built-in
 character set with the PaddleOCR model's metadata and is skipped without `build/weights/ppocr`.
+`tests/test_litemono_post.py` turns known disparities into colors through `--postprocess litemono`, compares them with
+matplotlib's magma (skipped without matplotlib), and checks the errors.
 `tests/test_qat_graph.py` writes small models in ONNX text syntax (conv / activation chains, SiLU and HardSwish
 patterns, MaxPool, Concat, nearest Resize, residual Adds, an activation beside another reader, squeeze-excitation,
 pooling + Gemm, LSTM), runs `qat_graph.load` and `make_quantizable`, exports them with `--act-qdq` and compares the

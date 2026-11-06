@@ -9,7 +9,7 @@ with --dump-outputs each one is also written to <prefix><index>.txt, one value p
 --postprocess <model> post-processes the outputs exactly like run-model.py (util/postprocess.py): for a detector
 (yolox, yolov3, yolo-fastest, yolo26) the boxes are drawn on the input and saved as <prefix><model>.rgb, a raw tensor
 with the layout and element type of the input, which tensor_to_image.py turns into an image; for ppocr the text is
-printed.
+printed; for litemono the depth map is saved in colors as <prefix>litemono.rgb (uint8), pale yellow close, black far.
 
 --input-range LO HI takes a uint8 input file and maps it to LO..HI the way nncase's --pre-process does
 (x - zero_point) * scale with scale = (HI - LO) / 255 and an integer zero point, so the ONNX model runs on the same
@@ -20,7 +20,7 @@ that round differently, so a QAT export would not give its reference result.
 
 Usage:
     python run-onnx.py model.onnx input.in [--output-prefix output] [--dump-outputs] [--input-range LO HI]
-                       [--postprocess yolox|yolov3|yolo-fastest|yolo26|ppocr [--score-thr 0.25] [--nms-thr 0.45]]
+                       [--postprocess yolox|yolov3|yolo-fastest|yolo26|ppocr|litemono [--score-thr 0.25] [--nms-thr 0.45]]
 
 Examples:
     python tensor_from_image.py test.jpg 416x416 --bgr --type f32 --output yolox-f32-bgr.in
@@ -35,6 +35,9 @@ Examples:
     python run-onnx.py yolo-fastest-1.1-320_int8_qop.onnx fastest.in --postprocess yolo-fastest
 
     python run-onnx.py ppocr-en-rec-qat.onnx build/data/ocr-synth/test/0000.u8 --input-range -1 1 --postprocess ppocr
+
+    python run-onnx.py lite-mono-tiny-640x192-opt.onnx build/data/kitti-lm/test/0000000000.u8 --input-range 0 1 --postprocess litemono
+    python tensor_to_image.py outputlitemono.rgb 640x192 --output depth.png
 """
 import argparse
 import os
