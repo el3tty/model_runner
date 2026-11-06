@@ -5,4 +5,5 @@ torch
 torchvision
 onnx2torch
 onnxsim
+onnxscript
 ultralytics

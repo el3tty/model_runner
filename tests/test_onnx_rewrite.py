@@ -1,5 +1,5 @@
 """util/onnx_rewrite.py on small models: each rule on the pattern it was written for, compared with onnxruntime by
-rewrite() itself, and close variants of those patterns, which must stay as they are. Needs onnx and onnxruntime."""
+rewrite() itself, and close variants of those patterns, which must stay as they are. Needs onnx, onnxruntime and onnxscript."""
 import collections
 
 import numpy as np
@@ -8,6 +8,7 @@ import pytest
 from onnx import helper, numpy_helper, parser
 
 pytest.importorskip("onnxruntime")
+pytest.importorskip("onnxscript")  # requirements-qat.txt
 
 from util import onnx_rewrite as rw  # noqa: E402
 
@@ -187,6 +188,47 @@ def test_a_quantized_model_is_refused():
     m = model(text, scale=np.float32(0.1), zero=np.uint8(128))
     with pytest.raises(ValueError, match="2 Q/DQ nodes"):
         rw.rewrite(m, log=lambda s: None)
+
+
+LAYERNORM = """
+g (float[1,2,3,4] x) => (float[1,6,4] y) {
+    r = Reshape(x, shape)
+    m = ReduceMean <axes = [-1]> (r)
+    d = Sub(r, m)
+    p = Pow(d, two)
+    v = ReduceMean <axes = [-1]> (p)
+    e = Add(v, eps)
+    t = Sqrt(e)
+    n = Div(d, t)
+    s = Mul(n, gamma)
+    y = Add(s, beta)
+}
+"""
+LAYERNORM_CONSTS = dict(shape=np.array([1, 6, 4]), two=np.float32(2), eps=np.float32(1e-6), gamma=rand(4), beta=rand(4))
+
+
+def test_token_reshape_sinks_past_a_layernorm():
+    _, fired = rewrite(model(LAYERNORM, **LAYERNORM_CONSTS))
+    assert fired == {"sink_layernorm": 1}
+
+
+@pytest.mark.parametrize("change", [
+    {"two": np.float32(3)},  # not a variance
+    {"eps": np.float32(0.5)},  # not an epsilon
+    {"gamma": rand(6, 4)},  # not per channel
+])
+def test_not_quite_a_layernorm_constants(change):
+    _, fired = rewrite(model(LAYERNORM, **{**LAYERNORM_CONSTS, **change}))
+    assert not fired
+
+
+@pytest.mark.parametrize("old, new", [
+    ("n = Div(d, t)", "n = Div(r, t)"),  # divides the input, not the centered tensor
+    ("v = ReduceMean <axes = [-1]> (p)", "v = ReduceMean <axes = [1]> (p)"),  # the variance over another axis
+])
+def test_not_quite_a_layernorm_wiring(old, new):
+    _, fired = rewrite(model(LAYERNORM.replace(old, new), **LAYERNORM_CONSTS))
+    assert not fired
 
 
 def test_lint_reports_what_costs_time():

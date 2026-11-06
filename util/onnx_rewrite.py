@@ -80,6 +80,7 @@ class Graph:
         return m
 
     def refresh(self):
+        self.found = {}
         self._prune()
         self._sort()
         self.writer = {o: n for n in self.nodes for o in n.output}
@@ -117,6 +118,12 @@ class Graph:
                 raise ValueError(f"cycle or missing input at {rest[0].op_type} {list(rest[0].input)}")
             pending = rest
         self.nodes = order
+
+    def blocks(self, kind):
+        """The blocks of find_blocks(), found once per state of the graph."""
+        if kind not in self.found:
+            self.found[kind] = find_blocks(self, kind)
+        return self.found[kind]
 
     def fresh(self, hint="t"):
         self.count += 1
@@ -232,41 +239,65 @@ def sink(g, wrapper, block, inputs=None):
     return Replace(block, add)
 
 
-def gelu_block(g, div):
-    """The five nodes of x * (1 + Erf(x / sqrt 2)) * 0.5 starting at their Div, else None."""
-    if div.op_type != "Div" or not is_scalar_near(g.const(div.input[1]), 2 ** 0.5):
-        return None
-    x = div.input[0]
-    chain = [div]
-    for op in ("Erf", "Add", "Mul", "Mul"):
-        users = g.readers[chain[-1].output[0]]
-        if len(users) != 1 or users[0].op_type != op:
-            return None
-        chain.append(users[0])
-    if x not in chain[3].input or not is_scalar_near(g.one_const(chain[4])[1] if g.one_const(chain[4]) else None, 0.5):
-        return None
-    return chain
+# GELU and LayerNorm are spelled out at opset 13 (nncase folds them back into one op), so they are several nodes that
+# must move together. They are written as onnxscript patterns: a tensor used twice, like d below, has to be the same
+# tensor in the graph, which a walk over the readers would have to check by hand.
+
+def gelu_pattern(op, x, sqrt2, one, half):
+    return op.Mul(op.Mul(x, op.Add(op.Erf(op.Div(x, sqrt2)), one)), half)
 
 
-def layernorm_block(g, mean):
-    """The nine nodes of a LayerNorm over the last axis starting at its first ReduceMean, else None."""
-    if mean.op_type != "ReduceMean" or list(attr(mean, "axes", [])) != [-1]:
-        return None
-    x = mean.input[0]
-    sub = next((u for u in g.readers[mean.output[0]] if u.op_type == "Sub" and u.input[0] == x), None)
-    if sub is None:
-        return None
-    chain = [mean, sub]
-    pow_ = next((u for u in g.readers[sub.output[0]] if u.op_type == "Pow"), None)
-    if pow_ is None:
-        return None
-    chain.append(pow_)
-    for op in ("ReduceMean", "Add", "Sqrt", "Div", "Mul", "Add"):
-        users = [u for u in g.readers[chain[-1].output[0]] if u.op_type == op]
-        if len(users) != 1:
-            return None
-        chain.append(users[0])
-    return chain
+def layernorm_pattern(op, x, two, eps, gamma, beta):
+    d = op.Sub(x, op.ReduceMean(x, axes=[-1], _allow_other_attributes=True))
+    var = op.ReduceMean(op.Pow(d, two), axes=[-1], _allow_other_attributes=True)
+    return op.Add(op.Mul(op.Div(d, op.Sqrt(op.Add(var, eps))), gamma), beta)
+
+
+def gelu_constants(g, b):
+    return (is_scalar_near(g.const(b["sqrt2"].name), 2 ** 0.5) and is_scalar_near(g.const(b["one"].name), 1)
+            and is_scalar_near(g.const(b["half"].name), 0.5))
+
+
+def layernorm_constants(g, b):
+    two, eps, gamma, beta = (g.const(b[k].name) for k in ("two", "eps", "gamma", "beta"))
+    shape = g.shape(b["x"].name)
+    if not is_scalar_near(two, 2) or eps is None or eps.size != 1 or not 0 < float(eps.reshape(())) < 1e-2:
+        return False
+    return gamma is not None and beta is not None and shape and gamma.shape == beta.shape == (shape[-1],)
+
+
+BLOCKS = {"gelu": (gelu_pattern, "Mul", gelu_constants), "layernorm": (layernorm_pattern, "Add", layernorm_constants)}
+
+
+def find_blocks(g, kind):
+    """{id of the first node of a block: its nodes in graph order, the last one writes the result}."""
+    from onnx_ir import from_proto
+    from onnxscript.rewriter import pattern
+
+    target, root, constants = BLOCKS[kind]
+    matcher = pattern.Pattern(target)
+    model = from_proto(g.to_model())
+    index = {id(n): i for i, n in enumerate(g.nodes)}
+    blocks = {}
+    for node in model.graph:
+        if node.op_type != root:
+            continue
+        m = matcher.match(model, model.graph, node)
+        if not m or not constants(g, m.bindings):
+            continue
+        nodes = sorted((g.writer[n.outputs[0].name] for n in m.nodes), key=lambda n: index[id(n)])
+        blocks[id(nodes[0])] = nodes
+    return blocks
+
+
+def gelu_block(g, first):
+    """The five nodes of a GELU, if `first` is the first of them; else None."""
+    return g.blocks("gelu").get(id(first))
+
+
+def layernorm_block(g, first):
+    """The nine nodes of a LayerNorm over the last axis, if `first` is the first of them; else None."""
+    return g.blocks("layernorm").get(id(first))
 
 
 # matmul_to_conv: a MatMul with a constant weight on [1, H, W, C] data is a 1x1 Conv between two Transposes.
