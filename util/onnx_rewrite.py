@@ -125,6 +125,10 @@ class Graph:
             self.found[kind] = find_blocks(self, kind)
         return self.found[kind]
 
+    def block_start(self, kind, last):
+        """The first node of the block of `kind` that ends in node `last`, else None."""
+        return next((b[0] for b in self.blocks(kind).values() if b[-1] is last), None)
+
     def fresh(self, hint="t"):
         self.count += 1
         return f"rw{self.count}_{hint.split('/')[-1]}"
@@ -253,6 +257,12 @@ def layernorm_pattern(op, x, two, eps, gamma, beta):
     return op.Add(op.Mul(op.Div(d, op.Sqrt(op.Add(var, eps))), gamma), beta)
 
 
+def normalized_matmul_pattern(op, q, k, eps_q, eps_k):
+    nq = op.Div(q, op.Clip(op.ReduceL2(q, axes=[-1], keepdims=1), eps_q))
+    nk = op.Div(k, op.Clip(op.ReduceL2(k, axes=[-1], keepdims=1), eps_k))
+    return op.MatMul(nq, op.Transpose(nk, perm=[0, 1, 3, 2]))
+
+
 def gelu_constants(g, b):
     return (is_scalar_near(g.const(b["sqrt2"].name), 2 ** 0.5) and is_scalar_near(g.const(b["one"].name), 1)
             and is_scalar_near(g.const(b["half"].name), 0.5))
@@ -266,7 +276,15 @@ def layernorm_constants(g, b):
     return gamma is not None and beta is not None and shape and gamma.shape == beta.shape == (shape[-1],)
 
 
-BLOCKS = {"gelu": (gelu_pattern, "Mul", gelu_constants), "layernorm": (layernorm_pattern, "Add", layernorm_constants)}
+def normalized_matmul_constants(g, b):
+    q, k = g.shape(b["q"].name), g.shape(b["k"].name)
+    tiny = all(g.const(b[e].name) is not None and g.const(b[e].name).size == 1 and float(g.const(b[e].name)) < 1e-6
+               for e in ("eps_q", "eps_k"))
+    return tiny and q and q == k and len(q) == 4 and q[0] == 1
+
+
+BLOCKS = {"gelu": (gelu_pattern, "Mul", gelu_constants), "layernorm": (layernorm_pattern, "Add", layernorm_constants),
+          "normalized_matmul": (normalized_matmul_pattern, "MatMul", normalized_matmul_constants)}
 
 
 def find_blocks(g, kind):
@@ -631,6 +649,28 @@ def generate_fold_conv_reshape_scale(g, m):
     return Replace([conv, r, m["node"]], [new, helper.make_node("Reshape", list(r.input), [m["node"].output[0]])])
 
 
+# normalize_after_matmul: normalize(q) @ normalize(k)^T of XCA is (q @ k^T) / (|q| * |k|^T): the division moves from the
+# two big tensors to the small [d, d] attention matrix. The MatMul then reads q and k unnormalized, whose rows differ in
+# size and share one quantization range; on Lite-Mono tiny that cost no accuracy on the board (5 ms less per frame).
+
+def match_normalize_after_matmul(g, node):
+    nodes = g.blocks("normalized_matmul").get(id(g.block_start("normalized_matmul", node)))
+    if nodes is None or nodes[-1] is not node:
+        return None
+    swap = g.writer[node.input[1]]
+    return {"matmul": node, "swap": swap, "q": g.writer[node.input[0]], "k": g.writer[swap.input[0]]}
+
+
+def generate_normalize_after_matmul(g, m):
+    matmul, swap, q, k = m["matmul"], m["swap"], m["q"], m["k"]
+    kt = transpose(g, k.input[0], (0, 1, 3, 2))
+    product = helper.make_node("MatMul", [q.input[0], kt.output[0]], [g.fresh("qk")])
+    norm_k = transpose(g, k.input[1], (0, 1, 3, 2))
+    norms = helper.make_node("Mul", [q.input[1], norm_k.output[0]], [g.fresh("norms")])
+    return Replace([q, k, swap, matmul], [kt, product, norm_k, norms,
+                                          helper.make_node("Div", [product.output[0], norms.output[0]], [matmul.output[0]])])
+
+
 # drop_empty_clip_max: Clip(x, min, "") is Clip(x, min), the export of clamp_min. onnx2torch cannot load the empty input,
 # so qat_graph.load() needs this form.
 
@@ -730,6 +770,7 @@ RULES = [
     Rule("sink_elementwise", match_sink_elementwise, generate_sink_elementwise),
     Rule("fold_conv_bias", match_fold_conv_bias, generate_fold_conv_bias),
     Rule("fold_conv_scale", match_fold_conv_scale, generate_fold_conv_scale),
+    Rule("normalize_after_matmul", match_normalize_after_matmul, generate_normalize_after_matmul),
 ]
 
 

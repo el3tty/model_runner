@@ -480,9 +480,9 @@ with a runtime that has the fast reflect Pad, Broadcast and GetItem:
 | Model | Runs on | abs-rel | abs-rel under 5 m | Time per image |
 |---|---|---|---|---|
 | lite-mono-tiny, float | onnxruntime | 0.107 | 0.256 | |
-| lite-mono-tiny, PTQ, rewritten | board | 0.113 | 0.291 | 78 ms |
+| lite-mono-tiny, PTQ, rewritten | board | 0.113 | 0.290 | 73 ms |
 | lite-mono, float | onnxruntime | 0.117 | 0.262 | |
-| lite-mono, PTQ, rewritten by hand, same graph | board | 0.120 | 0.307 | 111 ms |
+| lite-mono, PTQ, rewritten, without `normalize_after_matmul` | board | 0.120 | 0.307 | 111 ms |
 
 The frame to frame sd of abs-rel is about 0.03. Most of the KPU time is DDR traffic: tiny's wait per KPU call fits
 91 us + 533 us per MB + 2.5 us per million MACs (R2 0.94).
@@ -507,6 +507,7 @@ is applied until it no longer matches, and the graph is compared with the origin
 | `fold_conv_bias`, `fold_conv_scale`, `fold_conv_reshape_scale` | Add / Mul with a constant after a Conv | in the Conv |
 | `drop_expand` | Expand read as a divisor | gone, Div broadcasts |
 | `drop_empty_clip_max` | `Clip(x, min, "")` | `Clip(x, min)`, which `onnx2torch` can load |
+| `normalize_after_matmul` | `normalize(q) @ normalize(k)^T` | `(q @ k^T) / (\|q\| * \|k\|^T)`: the Div on the small matrix |
 
 The reason for most of them: nncase cannot put a Reshape inside a layer group, so every layout change is a DDR round
 trip. The rules are narrow on purpose: they match only the ops, layouts and shapes seen in YOLO26 and Lite-Mono (they do

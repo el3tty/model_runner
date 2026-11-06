@@ -231,6 +231,30 @@ def test_not_quite_a_layernorm_wiring(old, new):
     assert not fired
 
 
+NORMALIZED_MATMUL = """
+g (float[1,2,3,8] q, float[1,2,3,8] k) => (float[1,2,3,3] y) {
+    a = ReduceL2 <axes = [-1], keepdims = 1> (q)
+    b = Clip(a, eps)
+    c = Div(q, b)
+    d = ReduceL2 <axes = [-1], keepdims = 1> (k)
+    e = Clip(d, eps)
+    f = Div(k, e)
+    t = Transpose <perm = [0,1,3,2]> (f)
+    y = MatMul(c, t)
+}
+"""
+
+
+def test_normalize_after_matmul():
+    ops, fired = rewrite(model(NORMALIZED_MATMUL, eps=np.float32(1e-12)))
+    assert fired == {"normalize_after_matmul": 1} and ops["Div"] == 1
+
+
+def test_normalized_matmul_with_a_large_eps_stays():
+    _, fired = rewrite(model(NORMALIZED_MATMUL, eps=np.float32(0.5)))
+    assert not fired
+
+
 def test_lint_reports_what_costs_time():
     text = """
     g (float[1,4,6,8] x) => (float[1,4,8,10] y) {
