@@ -772,15 +772,21 @@ python run-model.py build/kmodel/ppocr-en-rec-qat.kmodel build/data/ocr-synth/te
 Depth (Lite-Mono): `--postprocess litemono` saves the depth map as an image in the magma color map: pale yellow close,
 through orange and purple, to black far (`util/litemono_post.py`). The color follows the model's disparity, 0..1, on the
 same scale for every image and model, so the float model and a kmodel can be compared by eye. Distances are relative:
-there are no metres in the picture. The
-input is a uint8 RGB `1x3x192x640` image, a `build/data/kitti-lm/test/*.u8` file or `tensor_from_image.py <image>
-640x192`. `run-onnx.py --input-range 0 1` runs the float model on the same file, and the result is uint8 either way:
+there are no metres in the picture. The input is a uint8 RGB `1x3x192x640` image, a `build/data/kitti-lm/test/*.u8` file
+or `tensor_from_image.py <image> 640x192 --crop`. `run-onnx.py --input-range 0 1` runs the float model on the same file,
+and the result is uint8 either way:
 
 ```
 python run-onnx.py build/onnx/lite-mono-tiny-640x192-opt.onnx build/data/kitti-lm/test/0000000000.u8 --input-range 0 1 --postprocess litemono --output-prefix=build/data/kitti-lm/onnx-
 python run-model.py build/kmodel/lite-mono-tiny-opt-640x192-u8-zoom.kmodel build/data/kitti-lm/test/0000000000.u8 --postprocess litemono --output-prefix=build/data/kitti-lm/kmodel-
 python tensor_to_image.py build/data/kitti-lm/onnx-litemono.rgb 640x192 --output build/data/kitti-lm/onnx-depth.png
 ```
+
+640×192 is much wider than most photos, and the model learned from KITTI's images, which have that shape. `--crop`
+scales the image as little as it takes to cover 640×192 and cuts off the rest, so shapes stay as they are, and a
+letterbox's padding does not waste the input. KITTI's horizon is at about 46% of the image height, and a level camera
+has its horizon near the middle, so the default center crop is close. For a camera that looks up or down, `--crop-y`
+moves the band, from 0 for the top of the image to 1 for the bottom.
 
 `run-onnx.py` runs onnxruntime without graph optimizations, which would turn the Q/DQ pairs of a QAT export into
 integer kernels that round differently.
@@ -859,7 +865,7 @@ python -m pytest tests
 
 needs pytest; no data files or models. `tests/test_tensor_image.py` runs `tensor_from_image.py` and
 `tensor_to_image.py` on small generated images: layout, channel order, element types and value range, letterbox
-padding, transparency and EXIF orientation, the round trip back to the same bytes, rounding / clipping and the
+padding, crop placement and scale, transparency and EXIF orientation, the round trip back to the same bytes, rounding / clipping and the
 errors. `tests/test_yolo_post.py` encodes known boxes into the raw head outputs of every `--postprocess` detector
 (YOLOX, YOLOv3, Yolo-Fastest, YOLO26 split / joined / DFL; square and rectangular inputs) and compares the printed
 detections with them: every stride, per-class NMS, the score threshold, outputs in any order, and the errors.

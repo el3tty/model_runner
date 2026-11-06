@@ -117,8 +117,51 @@ def test_from_image_exif_orientation(tmp_path):
     assert (out[:, 10:] == np.array([0, 0, 255])[:, None, None]).all()
 
 
+def row_image(path, w, h):
+    """An image whose red channel is the row number and green channel the column number."""
+    hwc = np.zeros((h, w, 3), np.uint8)
+    hwc[..., 0] = np.arange(h)[:, None]
+    hwc[..., 1] = np.arange(w)[None, :]
+    Image.fromarray(hwc, "RGB").save(path)
+    return hwc
+
+
+@pytest.mark.parametrize("args, top", [([], 8), (["--crop-y", "0"], 0), (["--crop-y", "0.25"], 4),
+                                       (["--crop-y", "0.5"], 8), (["--crop-y", "1"], 16)])
+def test_from_image_crop_y(tmp_path, args, top):
+    hwc = row_image(tmp_path / "a.png", 8, 20)
+    from_image(tmp_path / "a.png", "8x4", "--crop", *args, "--output", tmp_path / "a.bin")
+    assert np.array_equal(read(tmp_path / "a.bin", "u8", (1, 3, 4, 8))[0], hwc[top:top + 4].transpose(2, 0, 1))
+
+
+def test_from_image_crop_of_a_wide_image_is_centered(tmp_path):
+    hwc = row_image(tmp_path / "a.png", 20, 4)
+    from_image(tmp_path / "a.png", "8x4", "--crop", "--crop-y", "1", "--output", tmp_path / "a.bin")
+    assert np.array_equal(read(tmp_path / "a.bin", "u8", (1, 3, 4, 8))[0], hwc[:, 6:14].transpose(2, 0, 1))
+
+
+@pytest.mark.parametrize("w, h, scaled_h", [(40, 100, 20), (4, 10, 20)])  # scaled down 5 times, up 2 times
+def test_from_image_crop_is_resize_then_crop(tmp_path, w, h, scaled_h):
+    random_image(tmp_path / "a.png", w, h)
+    from_image(tmp_path / "a.png", "8x4", "--crop", "--output", tmp_path / "a.bin")
+    scaled = np.asarray(Image.open(tmp_path / "a.png").resize((8, scaled_h), Image.Resampling.BILINEAR))
+    want = scaled[8:12].transpose(2, 0, 1).astype(int)
+    assert np.abs(read(tmp_path / "a.bin", "u8", (1, 3, 4, 8))[0].astype(int) - want).max() <= 1
+
+
+@pytest.mark.parametrize("size", [(1242, 375), (1241, 374), (1920, 1080), (375, 1242), (641, 193), (3, 1000)])
+def test_from_image_crop_box_stays_in_the_image(tmp_path, size):
+    img = Image.new("RGB", size, (9, 9, 9))
+    img.save(tmp_path / "a.png")
+    for y in ("0", "1"):
+        from_image(tmp_path / "a.png", "640x192", "--crop", "--crop-y", y, "--output", tmp_path / "a.bin")
+        assert (read(tmp_path / "a.bin", "u8", (1, 3, 192, 640)) == 9).all()
+
+
 @pytest.mark.parametrize("args", [["4x4", "--range", "1"], ["4x4", "--range", "1", "--type", "u16"],
-                                  ["4x4", "--pad", "256"], ["0x4"], ["4by4"]])
+                                  ["4x4", "--pad", "256"], ["0x4"], ["4by4"], ["4x4", "--crop", "--letterbox"],
+                                  ["4x4", "--crop-y", "0.5"], ["4x4", "--crop", "--crop-y", "1.5"],
+                                  ["4x4", "--crop", "--crop-y", "-0.1"]])
 def test_from_image_rejects_bad_arguments(tmp_path, args):
     random_image(tmp_path / "a.png", 4, 4)
     r = from_image(tmp_path / "a.png", *args, "--output", tmp_path / "a.bin", ok=False)
