@@ -474,25 +474,186 @@ python eval/litemono_run.py build/kmodel/lite-mono-tiny-640x192-opt-u8-zoom.kmod
 python eval/litemono_eval.py --input build/data/kitti-lm/test --onnx build/onnx/lite-mono-tiny-640x192-opt.onnx --disp build/data/kitti-lm/disp-tiny.npz
 ```
 
-22 frames of drive 0048 against the LiDAR, per image median scaling (not comparable with the paper's table), board time
-with a runtime that has the fast reflect Pad, Broadcast and GetItem:
+22 frames of drive 0048 against the LiDAR, per image median scaling (not comparable with the paper's table). The board
+times need the k230 branch of `<nncase>`: its runtime has the fast reflect Pad, Broadcast and GetItem, its compiler
+`CombineQuantizePad`:
 
 | Model | Runs on | abs-rel | abs-rel under 5 m | Time per image |
 |---|---|---|---|---|
 | lite-mono-tiny, float | onnxruntime | 0.107 | 0.256 | |
-| lite-mono-tiny, PTQ, rewritten | board | 0.113 | 0.290 | 73 ms |
+| lite-mono-tiny, PTQ, rewritten | board | 0.112 | 0.289 | 61 ms |
 | lite-mono, float | onnxruntime | 0.117 | 0.262 | |
-| lite-mono, PTQ, rewritten, without `normalize_after_matmul` | board | 0.120 | 0.307 | 111 ms |
+| lite-mono, PTQ, rewritten, without `normalize_after_matmul` and `CombineQuantizePad` | board | 0.120 | 0.307 | 111 ms |
 
-The frame to frame sd of abs-rel is about 0.03. Most of the KPU time is DDR traffic: tiny's wait per KPU call fits
-91 us + 533 us per MB + 2.5 us per million MACs (R2 0.94).
+The frame to frame sd of abs-rel is about 0.03. Abs-rel is the mean error of the distance relative to the true distance:
+0.112 is about 11%.
+
+How lite-mono-tiny got from 527 ms to 61 ms, on the same board, without changing what the model computes:
+
+| Change | Where | Time per image |
+|---|---|---|
+| Starting point | | 527 ms |
+| Reflect Pad copies whole rows | runtime | 270 ms |
+| Broadcast fills whole rows | runtime | 152 ms |
+| GetItem copies one block | runtime | 126 ms |
+| [Graph rewrites](#onnx-rewrites): Linears as 1x1 Convs, q, k, v as three Convs | `onnx_opt.py` | 78 ms |
+| `normalize_after_matmul` | `onnx_opt.py` | 73 ms |
+| `CombineQuantizePad`: uint8 instead of float32 through the Pads | nncase | 61 ms |
 
 ### ONNX rewrites
 
-`convert/onnx_opt.py <in> <out>` folds constants and rewrites a model into the form the K230 runs best;
-`convert/onnx_opt.py <in> --lint` only reports what is left that costs time. `util/onnx_rewrite.py` holds the rules: a
-`match` function that looks at a few nodes and shapes, and a `generate` function that returns the new nodes. Each rule
-is applied until it no longer matches, and the graph is compared with the original on a random input after every rule.
+`convert/onnx_opt.py` rewrites a model into a form the K230 runs faster, without changing what it computes:
+
+```
+python convert/onnx_opt.py build/onnx/lite-mono-tiny-640x192.onnx build/onnx/lite-mono-tiny-640x192-opt.onnx
+python convert/onnx_opt.py build/onnx/some-model.onnx --lint
+```
+
+The first line writes the new model and reports which rules fired. The second changes nothing and only reports what is
+in the model that will cost time. This section explains the idea without assuming a machine learning background.
+
+#### Why a correct model can be slow
+
+An ONNX file describes a network as a graph: boxes are operations, arrows are tensors (arrays of numbers) flowing
+between them.
+
+```
+image --> [Conv] --> [GELU] --> [Conv] --> depth map
+```
+
+The K230's NPU, the KPU, is very fast at arithmetic and has a small fast memory of its own. Everything else lives in
+DDR, the main memory, which is much slower. nncase groups boxes into calls. Inside a call the data stays on the chip,
+between calls it goes out to DDR and comes back:
+
+```
+three calls:   DDR -> [Conv] -> DDR -> [GELU] -> DDR -> [Conv] -> DDR       6 trips through DDR
+
+one call:      DDR -> [Conv -> GELU -> Conv] -> DDR                         2 trips through DDR
+```
+
+That matters more than the arithmetic. Before these rewrites Lite-Mono spent about 95 ms per image waiting for the KPU,
+and of that about 77 ms was moving data and only about 3.5 ms was arithmetic. So the aim is: **fewer trips to DDR**.
+
+#### What stops boxes from merging
+
+A picture can be stored in two ways. NCHW keeps each colour in its own plane, NHWC keeps the colours of a pixel
+together:
+
+```
+NCHW                     NHWC
+
+R R R R                  RGB RGB RGB RGB
+R R R R                  RGB RGB RGB RGB
+G G G G
+G G G G
+B B B B
+B B B B
+```
+
+* A **Transpose** converts between such layouts. It moves every value, so it is a full pass over the tensor.
+* A **Reshape** keeps the values in place and gives them a new shape, as `[48, 160]` to `[7680]`.
+
+The KPU's Conv works on NCHW. nncase splits a group of boxes into tiles that fit on the chip, and follows each tile
+backwards through the boxes. It cannot do that through a Reshape, so **a Reshape between two boxes ends the call**, and
+the data goes to DDR. Many networks written in PyTorch are full of these, because it is natural to write them that way.
+
+#### What a rule is
+
+The rewriter does what a person would do with the drawing: find a small known shape in the graph, and replace it with
+a better one. Every rule in `util/onnx_rewrite.py` is two small functions:
+
+```
+match(graph, node)     do the nodes around this one look like my pattern?
+generate(graph, m)     what should replace them?
+```
+
+For example, a Transpose to NHWC followed by one back to NCHW does nothing:
+
+```
+before:   x -> [to NHWC] -> [to NCHW] -> y
+
+after:    x -> y
+```
+
+`rewrite()` tries the rules in order until none fires. After each one it runs the graph on a random input with
+onnxruntime and compares the output with the original model's, and stops with an error if it changed. The longest
+patterns, GELU and LayerNorm, are written with `onnxscript`, which looks like the formula itself:
+
+```python
+def layernorm_pattern(op, x, two, eps, gamma, beta):
+    d = op.Sub(x, op.ReduceMean(x, axes=[-1], _allow_other_attributes=True))
+    var = op.ReduceMean(op.Pow(d, two), axes=[-1], _allow_other_attributes=True)
+    return op.Add(op.Mul(op.Div(d, op.Sqrt(op.Add(var, eps))), gamma), beta)
+```
+
+#### The rewrites
+
+**A Linear is a 1x1 Conv.** A Linear layer mixes the channels of each pixel separately. A 1x1 Conv does the same thing:
+it looks at one pixel at a time, with the same weights. They only differ in the layout they expect. PyTorch's Linear
+wants NHWC, so Lite-Mono's blocks are wrapped in Transposes, and nncase then adds Reshapes around every Linear:
+
+```
+before   x -> [to NHWC] -> [Linear] -> [GELU] -> [Linear] -> [x gamma] -> [to NCHW] -> y
+
+1.       `matmul_to_conv`: each Linear becomes a Conv with a Transpose on each side
+
+         x -> [to NHWC] -> [to NCHW] -> [Conv] -> [to NHWC] -> [GELU] -> [to NCHW] -> [Conv] -> [to NHWC] -> ...
+
+2.       `cancel_transposes`, `sink_gelu`, `sink_elementwise`: Transposes move along and cancel in pairs
+
+3.       `fold_conv_scale`: multiplying by a constant is done by changing the Conv's weights
+
+after    x -> [Conv] -> [GELU] -> [Conv] -> y
+```
+
+There is nothing left to stop those boxes merging: Lite-Mono's small blocks went from about five KPU calls to two.
+
+**Constants fold into a Conv.** A Conv already multiplies and adds, so a following Add or Mul by a constant can be
+built into its weights ahead of time (`fold_conv_bias`, `fold_conv_scale`, `fold_conv_reshape_scale`):
+
+```
+before   x -> [Conv] -> [+ b] -> [x gamma] -> y
+
+after    x -> [Conv with new weights] -> y
+```
+
+**One Conv and a split become several Convs.** nncase runs Slice, Split and Gather on the CPU, which cuts the graph in
+two. But each part of a Conv's output comes from its own part of the weights, so the Conv can be cut instead
+(`split_silu_conv`, `split_qkv_heads`, `split_qkv`):
+
+```
+before                                     after
+
+x -> [Conv] -> [Split] --> a               x --> [Conv, first half]  --> a
+                       \-> b                 \-> [Conv, second half] --> b
+```
+
+**An Expand that only copies goes away.** Dividing a table by one number per row does not need that number written out
+for every column first, Div does that by itself (`drop_expand`):
+
+```
+before   n -> [Expand to the size of x] -> [x / n]
+
+after    n -> [x / n]
+```
+
+**Divide the small result, not the large inputs.** Lite-Mono's attention compares channels with each other. It scales
+every row of `q` and `k` to length 1 and then multiplies them. Scaling a row before a multiplication gives the same
+answer as scaling the result afterwards, and the result is tiny (`normalize_after_matmul`):
+
+```
+before   q (245,760 numbers) -> [/ |q|] --\
+                                           [MatMul] -> attention (128 numbers)
+         k (245,760 numbers) -> [/ |k|] --/
+
+after    q ----------\
+                      [MatMul] -> [/ (|q| x |k|)] -> attention
+         k ----------/
+```
+
+The rule only fires when the result really is much smaller: at least 16 tokens per channel of a head.
+
+#### All the rules
 
 | Rule | Pattern | Result |
 |---|---|---|
@@ -509,13 +670,36 @@ is applied until it no longer matches, and the graph is compared with the origin
 | `drop_empty_clip_max` | `Clip(x, min, "")` | `Clip(x, min)`, which `onnx2torch` can load |
 | `normalize_after_matmul` | `normalize(q) @ normalize(k)^T` | `(q @ k^T) / (\|q\| * \|k\|^T)`: the Div on the small matrix |
 
-The reason for most of them: nncase cannot put a Reshape inside a layer group, so every layout change is a DDR round
-trip. The rules are narrow on purpose: they match only the ops, layouts and shapes seen in YOLO26 and Lite-Mono (they do
-nothing to PP-OCR and YOLOX). Add a pattern for a new model after looking at its graph, rather than loosening a rule.
+The rules are narrow on purpose: they match only the ops, layouts and shapes seen in YOLO26 and Lite-Mono, and do
+nothing to PP-OCR and YOLOX. A close look-alike is left as it is. Add a pattern for a new model after looking at its graph,
+rather than loosening a rule on a guess. `--lint` is the place to start. For plain Lite-Mono tiny it prints:
 
-Rewrite the float model, before QAT: the rules keep the float function, so the weights carry over, and the quantizers
-then sit on the tensors the K230 stores. `qat_graph.load()` takes the rewritten ONNX. `onnx_opt.py` refuses a model with
-Q/DQ nodes: the patterns do not match across a pair, and a fold would remove a tensor that has a range.
+```
+lint: 3 Reshape between compute ops: nncase cannot fuse across them, a DDR round trip each
+lint: 48 Transpose: each a separate KPU pass or a fusion boundary
+lint: 9 Gather: runs on the CPU
+lint: 6 Expand: runs on the CPU, and copies
+lint: 7 reflect Pad: runs on the CPU, AI2D gave zero borders in mirror mode
+```
+
+Its lines are hints from what was measured so far, not measurements of the new model. It counts ops and does not know
+how large they are, and some Reshapes are really needed: attention needs its own layout.
+
+#### Where it fits
+
+The rules keep the float function, so the trained weights carry over. They run on the float model, before quantization:
+
+```
+.pth --> export --> onnx_opt.py --+--> nncase with calibration images --> kmodel       (PTQ)
+                                  |
+                                  +--> qat_train.py --> qat_export.py --> nncase --> kmodel    (QAT)
+```
+
+`qat_graph.load()` takes the rewritten ONNX, so QAT trains the graph the K230 runs. `onnx_opt.py` refuses a model that
+already has Q/DQ nodes: the patterns do not match across a pair, and a fold would remove a tensor that has a range.
+
+Changes that alter the function, like zero padding instead of reflect padding, do not belong here. They need the
+accuracy checked, and usually training: Lite-Mono's abs-rel went from 0.107 to 0.112 in float with zero padding.
 
 ## One image
 
