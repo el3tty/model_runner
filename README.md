@@ -4,6 +4,33 @@ Scripts to run YOLO detectors as ONNX (onnxruntime, PC) and as K230 kmodels (boa
 measure their COCO val2017 AP the same way for both. `convert/` holds the exports and the ONNX rewriter, `eval/` the
 measurements; run everything from this folder.
 
+## Contents
+
+* [Test PC and placeholders](#test-pc-and-placeholders)
+* [Requirements](#requirements)
+* [Supported models](#supported-models)
+  * [YOLO26n](#yolo26n)
+  * [Quantization-aware training (QAT): YOLOX-nano and PP-OCR](#quantization-aware-training-qat-yolox-nano-and-pp-ocr)
+    * [YOLOX-nano](#yolox-nano)
+    * [PP-OCR recognizer](#pp-ocr-recognizer)
+    * [Running QAT on RunPod](#running-qat-on-runpod)
+  * [YOLOv3 and Yolo-Fastest](#yolov3-and-yolo-fastest)
+  * [Lite-Mono](#lite-mono)
+* [Optimizing a model with graph rewrites](#optimizing-a-model-with-graph-rewrites)
+  * [Why a correct model can be slow](#why-a-correct-model-can-be-slow)
+  * [What stops boxes from merging](#what-stops-boxes-from-merging)
+  * [What a rewrite rule is](#what-a-rewrite-rule-is)
+  * [The rewrites, one by one](#the-rewrites-one-by-one)
+  * [All the rewrite rules](#all-the-rewrite-rules)
+  * [Where the rewrites fit in the workflow](#where-the-rewrites-fit-in-the-workflow)
+* [Running a model on one input](#running-a-model-on-one-input)
+* [Measuring detection accuracy on COCO val2017](#measuring-detection-accuracy-on-coco-val2017)
+* [COCO val2017 results](#coco-val2017-results)
+* [Debugging with runtime and simulator dumps](#debugging-with-runtime-and-simulator-dumps)
+* [Running the tests](#running-the-tests)
+
+## Test PC and placeholders
+
 PC times and memory limits below were measured on this PC (the "test PC"); times on the board are K230 times:
 
 | Part | Test PC |
@@ -39,7 +66,7 @@ the commands below.
   pip install -r requirements-qat.txt
   ```
 
-  YOLOX QAT also needs the `yolox` package, from its repository (see [the RunPod commands](#qat-training-on-runpod)).
+  YOLOX QAT also needs the `yolox` package, from its repository (see [the RunPod commands](#running-qat-on-runpod)).
   `run-model.py` and `eval/coco_run.py` need `nncaseruntime` from the nncase build: a link to its `nncaseruntime` folder
   in this folder is enough, e.g. to `<nncase>/build-rel/install/nncaseruntime`.
 * nncase compiler: build the CLI in Release (calibration runs the model in nncase's own evaluator, about 5 s per
@@ -61,7 +88,7 @@ the commands below.
   tar cf - --exclude=__pycache__ --exclude=.pytest_cache -C eval coco_run.py litemono_run.py -C .. run-model.py util | ssh root@<board> "tar xmf - -C <bdir>"
   ```
 
-## Models
+## Supported models
 
 The name is the `--postprocess` of `run-onnx.py` / `run-model.py` and, for the detectors, the `--detect` of the
 COCO scripts.
@@ -89,7 +116,7 @@ All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yol
 
    The graph ends at the one-to-many head (`end2end=False`): per stride 8/16/32 a box map `[1, 4, H/s, W/s]`
    (l, t, r, b in strides) and a class-logit map `[1, 80, H/s, W/s]`, kept apart so each gets its own quantization
-   scale. BatchNorm and the 1/255 input scaling are folded. [`onnx_opt.py`](#onnx-rewrites) then makes the
+   scale. BatchNorm and the 1/255 input scaling are folded. [`onnx_opt.py`](#optimizing-a-model-with-graph-rewrites) then makes the
    `cv1(x).chunk(2)` of every C3k2 / C2PSA block two convs and the qkv conv + split of both attention blocks three
    (q, k, v), because nncase runs Slice / Split on the CPU. `build/onnx/yolo26n-640.onnx` is the original graph (same AP, about
    20 ms slower on the K230 with the same input type; see the results).
@@ -137,7 +164,7 @@ All ONNX models end at the raw head outputs (no box decoding, no NMS); `util/yol
    k230
    ```
 
-### QAT: YOLOX-nano and the PP-OCR recognizer
+### Quantization-aware training (QAT): YOLOX-nano and PP-OCR
 
 `qat_train.py <task>` fine-tunes a model for the K230's uint8 quantization; `yolox` and `ppocr` are the tasks. The
 fake-quant model is the network as the K230 runs it: `util/qat_graph.py` puts the quantizers where the compile path
@@ -341,7 +368,7 @@ k230
 That needs an nncase whose Q/DQ import (`QdqQuantSchemePass`) handles LSTM and MatMul weights and the pre-processed
 input (the k230 branch of `<nncase>`); an older one fails on the LSTM with "Invalid w_quant_type".
 
-#### QAT training on RunPod
+#### Running QAT on RunPod
 
 YOLOX training is CPU-bound (data augmentation): about 5 hours on a rented RTX 4090 pod with 10 vCPUs at `-b 16`, not
 on the test PC. PP-OCR renders its training lines on the pod (no data set to upload) and fits the test PC's GPU as well.
@@ -496,11 +523,11 @@ How lite-mono-tiny got from 527 ms to 61 ms, on the same board, without changing
 | Reflect Pad copies whole rows | runtime | 270 ms |
 | Broadcast fills whole rows | runtime | 152 ms |
 | GetItem copies one block | runtime | 126 ms |
-| [Graph rewrites](#onnx-rewrites): Linears as 1x1 Convs, q, k, v as three Convs | `onnx_opt.py` | 78 ms |
+| [Graph rewrites](#optimizing-a-model-with-graph-rewrites): Linears as 1x1 Convs, q, k, v as three Convs | `onnx_opt.py` | 78 ms |
 | `normalize_after_matmul` | `onnx_opt.py` | 73 ms |
 | `CombineQuantizePad`: uint8 instead of float32 through the Pads | nncase | 61 ms |
 
-### ONNX rewrites
+## Optimizing a model with graph rewrites
 
 `convert/onnx_opt.py` rewrites a model into a form the K230 runs faster, without changing what it computes:
 
@@ -512,7 +539,7 @@ python convert/onnx_opt.py build/onnx/some-model.onnx --lint
 The first line writes the new model and reports which rules fired. The second changes nothing and only reports what is
 in the model that will cost time. This section explains the idea without assuming a machine learning background.
 
-#### Why a correct model can be slow
+### Why a correct model can be slow
 
 An ONNX file describes a network as a graph: boxes are operations, arrows are tensors (arrays of numbers) flowing
 between them.
@@ -534,7 +561,7 @@ one call:      DDR -> [Conv -> GELU -> Conv] -> DDR                         2 tr
 That matters more than the arithmetic. Before these rewrites Lite-Mono spent about 95 ms per image waiting for the KPU,
 and of that about 77 ms was moving data and only about 3.5 ms was arithmetic. So the aim is: **fewer trips to DDR**.
 
-#### What stops boxes from merging
+### What stops boxes from merging
 
 A picture can be stored in two ways. NCHW keeps each colour in its own plane, NHWC keeps the colours of a pixel
 together:
@@ -557,7 +584,7 @@ The KPU's Conv works on NCHW. nncase splits a group of boxes into tiles that fit
 backwards through the boxes. It cannot do that through a Reshape, so **a Reshape between two boxes ends the call**, and
 the data goes to DDR. Many networks written in PyTorch are full of these, because it is natural to write them that way.
 
-#### What a rule is
+### What a rewrite rule is
 
 The rewriter does what a person would do with the drawing: find a small known shape in the graph, and replace it with
 a better one. Every rule in `util/onnx_rewrite.py` is two small functions:
@@ -586,7 +613,7 @@ def layernorm_pattern(op, x, two, eps, gamma, beta):
     return op.Add(op.Mul(op.Div(d, op.Sqrt(op.Add(var, eps))), gamma), beta)
 ```
 
-#### The rewrites
+### The rewrites, one by one
 
 **A Linear is a 1x1 Conv.** A Linear layer mixes the channels of each pixel separately. A 1x1 Conv does the same thing:
 it looks at one pixel at a time, with the same weights. They only differ in the layout they expect. PyTorch's Linear
@@ -653,7 +680,7 @@ after    q ----------\
 
 The rule only fires when the result really is much smaller: at least 16 tokens per channel of a head.
 
-#### All the rules
+### All the rewrite rules
 
 | Rule | Pattern | Result |
 |---|---|---|
@@ -685,7 +712,7 @@ lint: 7 reflect Pad: runs on the CPU, AI2D gave zero borders in mirror mode
 Its lines are hints from what was measured so far, not measurements of the new model. It counts ops and does not know
 how large they are, and some Reshapes are really needed: attention needs its own layout.
 
-#### Where it fits
+### Where the rewrites fit in the workflow
 
 The rules keep the float function, so the trained weights carry over. They run on the float model, before quantization:
 
@@ -701,7 +728,7 @@ already has Q/DQ nodes: the patterns do not match across a pair, and a fold woul
 Changes that alter the function, like zero padding instead of reflect padding, do not belong here. They need the
 accuracy checked, and usually training: Lite-Mono's abs-rel went from 0.107 to 0.112 in float with zero padding.
 
-## One image
+## Running a model on one input
 
 `tensor_from_image.py` writes the raw input tensor, `run-onnx.py` / `run-model.py` run the model and, with
 `--postprocess <detector>`, draw the detections into a tensor of the same layout, and `tensor_to_image.py` turns it
@@ -745,7 +772,7 @@ python run-model.py build/kmodel/ppocr-en-rec-qat.kmodel build/data/ocr-synth/te
 `run-onnx.py` runs onnxruntime without graph optimizations, which would turn the Q/DQ pairs of a QAT export into
 integer kernels that round differently.
 
-## COCO val2017 AP
+## Measuring detection accuracy on COCO val2017
 
 The same 5000 prepared input tensors go to the kmodel and to the ONNX model; the decoding, thresholds and NMS are the
 model's own evaluation settings (`PREP` in `util/coco.py`).
@@ -782,7 +809,7 @@ Evaluation settings per model:
 | `yolov3`, `yolo-fastest` | 0.005 | 0.45 | every class above conf |
 | `yolo26` | 0.001 | 0.7 | every class above conf (Ultralytics val; square 640 input instead of rectangular batches) |
 
-## Results
+## COCO val2017 results
 
 COCO val2017, 5000 images, measured with the steps above:
 
@@ -798,7 +825,7 @@ COCO val2017, 5000 images, measured with the steps above:
 Time per image is `coco_run.py`'s `run`: set the input, run, read all outputs. The YOLOv3 AP is likely inflated: the
 ONNX model zoo model may have been trained on images that are in val2017.
 
-## Runtime and simulator dumps
+## Debugging with runtime and simulator dumps
 
 The K230 simulator gives the board's results bit for bit, so a kmodel can be debugged on the PC. nncase's Debug
 runtime dumps the tensors of every CPU op, including the inputs and outputs of each KPU call, and with
@@ -811,7 +838,7 @@ the dumps and how to read them: "Debug dumps and check points" in `<nncase>/src/
 python <nncase>/tools/ckpt_dump.py 'dumps/Runtime/1$1_7.ckpt/act_dm_write.chk' --kind P --record 0
 ```
 
-## Tests
+## Running the tests
 
 ```
 python -m pytest tests
