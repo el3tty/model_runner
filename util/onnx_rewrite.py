@@ -276,11 +276,16 @@ def layernorm_constants(g, b):
     return gamma is not None and beta is not None and shape and gamma.shape == beta.shape == (shape[-1],)
 
 
+# The attention matrix must be clearly smaller than q and k: tokens / channels per head. Lite-Mono's smallest is 30. In
+# attention over tokens the matrix is the larger tensor, and moving the division there would add work.
+MIN_TOKENS_PER_CHANNEL = 16
+
+
 def normalized_matmul_constants(g, b):
     q, k = g.shape(b["q"].name), g.shape(b["k"].name)
     tiny = all(g.const(b[e].name) is not None and g.const(b[e].name).size == 1 and float(g.const(b[e].name)) < 1e-6
                for e in ("eps_q", "eps_k"))
-    return tiny and q and q == k and len(q) == 4 and q[0] == 1
+    return tiny and q and q == k and len(q) == 4 and q[0] == 1 and q[3] >= MIN_TOKENS_PER_CHANNEL * q[2]
 
 
 BLOCKS = {"gelu": (gelu_pattern, "Mul", gelu_constants), "layernorm": (layernorm_pattern, "Add", layernorm_constants),

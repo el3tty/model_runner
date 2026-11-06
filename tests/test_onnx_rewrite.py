@@ -232,7 +232,7 @@ def test_not_quite_a_layernorm_wiring(old, new):
 
 
 NORMALIZED_MATMUL = """
-g (float[1,2,3,8] q, float[1,2,3,8] k) => (float[1,2,3,3] y) {
+g (float[1,2,3,48] q, float[1,2,3,48] k) => (float[1,2,3,3] y) {
     a = ReduceL2 <axes = [-1], keepdims = 1> (q)
     b = Clip(a, eps)
     c = Div(q, b)
@@ -248,6 +248,14 @@ g (float[1,2,3,8] q, float[1,2,3,8] k) => (float[1,2,3,3] y) {
 def test_normalize_after_matmul():
     ops, fired = rewrite(model(NORMALIZED_MATMUL, eps=np.float32(1e-12)))
     assert fired == {"normalize_after_matmul": 1} and ops["Div"] == 1
+
+
+@pytest.mark.parametrize("tokens, channels", [(47, 3), (8, 3), (3, 8)])
+def test_normalized_matmul_without_a_clear_gain_stays(tokens, channels):
+    text = NORMALIZED_MATMUL.replace("float[1,2,3,48]", f"float[1,2,{channels},{tokens}]")
+    text = text.replace("float[1,2,3,3]", f"float[1,2,{channels},{channels}]")
+    _, fired = rewrite(model(text, eps=np.float32(1e-12)))
+    assert not fired
 
 
 def test_normalized_matmul_with_a_large_eps_stays():
